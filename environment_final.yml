@@ -1,0 +1,13 @@
+name: mpri
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - numpy
+  - matplotlib
+  - h5py
+  - pip
+  - python=3.11
+  - pytorch::pytorch
+  - pytorch-cuda=12.4
