@@ -8,6 +8,8 @@ MPRI（Multi-Path Residual Inference）网络用于基于 CSI/CFR 信号的室�
 
 ```
 MPRI/
+├── config/
+│   └── mpri_baseline.yaml   # 训练配置（YAML）
 ├── src/
 │   ├── model.py          # MPRI 网络定义
 │   └── data.py           # 数据集加载与归一化
@@ -19,21 +21,20 @@ MPRI/
 │   └── temp/             # 可选临时目录
 ├── train_mpri.py         # 训练入口
 ├── evaluate_mpri.py      # 评估入口
-├── checkpoints/          # 模型权重（运行时生成）
-├── plots/                # 损失曲线（运行时生成）
-└── results/              # 预测结果（运行时生成）
+├── runs/                 # 训练实验输出目录（运行时生成）
+└── results/              # 评估脚本导出的预测结果（运行时生成）
 ```
 
 ## 输入格式
 
 模型输入为 CSI 矩阵 `(B, C, H, W)`：
 
-| 维度 | 含义 |
-|------|------|
-| B | batch size |
-| C | AP / gNB 数 (Ng)，自动从输入数据适配 |
-| H | 子载波数 (Ns)，自动从输入数据适配 |
-| W | MIMO 通道数 (Np)，`num_tx_ant * num_rx_ant * 2` |
+| 维度 | 含义                                            |
+| ---- | ----------------------------------------------- |
+| B    | batch size                                      |
+| C    | AP / gNB 数 (Ng)，自动从输入数据适配            |
+| H    | 子载波数 (Ns)，自动从输入数据适配               |
+| W    | MIMO 通道数 (Np)，`num_tx_ant * num_rx_ant * 2` |
 
 W 维度采用幅度-相位交织排列：`[amp₁, phase₁, amp₂, phase₂, ..., amp₁₆, phase₁₆]`
 
@@ -58,9 +59,9 @@ python scripts/convert_cfr_to_csi.py
 
 脚本会生成两个策略文件（AP 数自动适配，不固定）：
 
-| 输出文件 | 说明 | 样本数 |
-|----------|------|--------|
-| `data/csi/csi_strict.h5` | 仅保留所有 AP 都有信号的位置 | 由数据决定 |
+| 输出文件                 | 说明                               | 样本数     |
+| ------------------------ | ---------------------------------- | ---------- |
+| `data/csi/csi_strict.h5` | 仅保留所有 AP 都有信号的位置       | 由数据决定 |
 | `data/csi/csi_padded.h5` | 至少一个 AP 有信号，缺失 AP 零填充 | 由数据决定 |
 
 常用参数示例：
@@ -77,26 +78,59 @@ python scripts/convert_cfr_to_csi.py \
 
 ```bash
 python train_mpri.py \
-  --dataset data/csi/csi_strict.h5 \
-  --epochs 100 \
-  --batch-size 8 \
-  --amp \
-  --device cuda \
-  --save-path checkpoints/model.pt \
-  --loss-figure plots/loss_curve.png
+  --config config/mpri_baseline.yaml
 ```
 
-关键参数：
-- `--amp`：混合精度训练，减少显存占用（RTX 3050 Ti 等 4GB 显存必须开启）
-- `--dataset`：数据集路径，传入转换后的 `csi_*.h5`
-- `--epochs`：训练轮数（论文默认 400）
-- `--batch-size`：批大小
+可选覆盖参数（优先级高于 YAML）：
+
+```bash
+python train_mpri.py \
+  --config config/mpri_baseline.yaml \
+  --epochs 100 \
+  --batch-size 8 \
+  --amp
+```
+
+默认采用 `YAML -> CLI 显式覆盖` 合并策略，训练启动后会把最终生效配置完整保存到实验目录中的 `config.yaml`。
+
+### 统一实验输出目录
+
+每次训练会在 `runs/` 下新建实验目录：
+
+```text
+{experiment.name}-{YYYY-MM-DD-HH-MM-SS}
+```
+
+其中 `experiment.name` 从 YAML 的 `experiment.name` 读取。
+
+每次实验目录至少包含：
+
+```text
+runs/
+  mpri-baseline-2026-04-16-12-30-45/
+    config.yaml
+    train.log
+    metrics.csv
+    checkpoints/
+      best.pt
+      last.pt
+    tensorboard/
+    loss_curve.png
+```
+
+说明：
+- `config.yaml`：本次训练最终实际生效配置快照
+- `train.log`：训练终端输出完整日志
+- `metrics.csv`：按 epoch 持久化指标（含 train/val loss、RMSE、LR 等）
+- `checkpoints/best.pt`：验证集最优模型
+- `checkpoints/last.pt`：训练结束最终模型
+- `tensorboard/`：TensorBoard 日志目录
 
 ## 评估
 
 ```bash
 python evaluate_mpri.py \
-  --checkpoint checkpoints/model.pt \
+  --checkpoint runs/<your-experiment>/checkpoints/best.pt \
   --dataset data/csi/csi_strict.h5 \
   --split val \
   --batch-size 64

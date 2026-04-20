@@ -7,6 +7,8 @@ dependencies:
   - numpy
   - matplotlib
   - h5py
+  - pyyaml
+  - tensorboard
   - pip
   - python=3.11
   - pytorch::pytorch

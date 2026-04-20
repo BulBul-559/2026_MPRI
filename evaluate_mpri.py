@@ -39,8 +39,17 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple[MPRINet, di
     in_channels = int(stats["mean"].shape[0])
     config = checkpoint.get("config", {})
 
+    if isinstance(config, dict):
+        if "dropout" in config:
+            dropout = config.get("dropout", 0.3)
+        else:
+            model_cfg = config.get("model", {})
+            dropout = model_cfg.get("dropout", 0.3) if isinstance(model_cfg, dict) else 0.3
+    else:
+        dropout = 0.3
+
     model = MPRINet(
-        dropout=config.get("dropout", 0.3),
+        dropout=float(dropout),
         in_channels=in_channels,
     )
     model.load_state_dict(checkpoint["model_state"])
