@@ -1,19 +1,22 @@
 experiment:
-  name: mpri-baseline
-  output_root: runs
+  name: mpri_front3d_5431_smoke
+  output_root: runs/train
 
 data:
-  dataset: data/csi/bar/csi_padded.h5
-  val_split: 0.2
-  split_strategy: position_level
+  dataset: data/processed/front3d_5431_smoke/csi_padded_log_abs_64_snr3.h5
+  train_split: 0.80
+  val_split: 0.00
+  test_split: 0.20
+  split_strategy: ue_level
 
 model:
   dropout: 0.3
+  output_dim: 2
 
 optimizer:
-  type: AdamW
+  type: Adam
   learning_rate: 0.001
-  weight_decay: 0.0001
+  weight_decay: 0.0
 
 scheduler:
   type: StepLR
@@ -25,13 +28,14 @@ loss:
   eps: 1.0e-8
 
 training:
-  epochs: 50
-  batch_size: 8
-  seed: 3407
-  device: cuda
+  epochs: 1
+  batch_size: 4
+  seed: 2026
+  device: cpu
   amp: false
   max_norm: 5.0
 
 logging:
   save_loss_figure: true
   loss_figure_name: loss_curve.png
+  evaluate_test_each_epoch: true

@@ -218,7 +218,7 @@ class OutputModule(nn.Module):
     - Linear 输出三维坐标 (x, y, z)
     """
 
-    def __init__(self, in_channels: int = 256, dropout: float = 0.3) -> None:
+    def __init__(self, in_channels: int = 256, dropout: float = 0.3, output_dim: int = 2) -> None:
         super().__init__()
         self.head = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=False),
@@ -227,13 +227,13 @@ class OutputModule(nn.Module):
             nn.AdaptiveMaxPool2d((1, 1)),  # -> (B, C, 1, 1)
             nn.Flatten(1),                 # -> (B, C)
             nn.Dropout(dropout),
-            nn.Linear(in_channels, 3),     # -> (B, 3)
+            nn.Linear(in_channels, output_dim),     # -> (B, D)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         输入: (B, 256, H, W)
-        输出: (B, 3)
+        输出: (B, D)
         """
         return self.head(x)
 
@@ -255,13 +255,14 @@ class MPRINet(nn.Module):
         self,
         in_channels: int = 2,
         dropout: float = 0.3,
+        output_dim: int = 2,
     ) -> None:
         super().__init__()
 
         self.input_module = InputModule(in_channels)
         self.mpri_upper = UpperHalf(256, 64)  # 输入256通道，输出256通道
         self.mpri_lower = LowerHalf(channels=256, num_stages=3)  # 论文版固定3-stage
-        self.output_module = OutputModule(256, dropout=dropout)
+        self.output_module = OutputModule(256, dropout=dropout, output_dim=output_dim)
 
         self._init_weights()
 

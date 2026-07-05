@@ -1,0 +1,14 @@
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.h5 binary
+*.hdf5 binary
+*.mat binary
+*.npy binary
+*.npz binary
+*.pt binary
+*.pth binary
+*.ckpt binary
+*.onnx binary
+*.safetensors binary

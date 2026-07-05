@@ -21,7 +21,7 @@ from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
-from src.data import CFRDataset, NormalizeTransform
+from src.data import CFRDataset, NormalizeTransform, split_indices_by_group
 from src.model import MPRINet
 
 
@@ -32,11 +32,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "data": {
         "dataset": "data/csi/csi_strict.h5",
+        "train_split": 0.7,
         "val_split": 0.2,
+        "test_split": 0.1,
         "split_strategy": "position_level",
     },
     "model": {
         "dropout": 0.3,
+        "output_dim": 2,
     },
     "optimizer": {
         "type": "AdamW",
@@ -63,6 +66,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "logging": {
         "save_loss_figure": True,
         "loss_figure_name": "loss_curve.png",
+        "evaluate_test_each_epoch": False,
     },
 }
 
@@ -154,6 +158,8 @@ def train_one_epoch(
         running_mean_err += torch.linalg.norm(diff, dim=-1).sum().item()
         n_samples += batch_size
 
+    if n_samples == 0:
+        return Metrics(float("nan"), float("nan"), float("nan"))
     epoch_loss = running_loss / n_samples
     rmse = math.sqrt(running_sqerr / n_samples)
     mean_err = running_mean_err / n_samples
@@ -188,6 +194,8 @@ def evaluate(
         running_mean_err += torch.linalg.norm(diff, dim=-1).sum().item()
         n_samples += inputs.size(0)
 
+    if n_samples == 0:
+        return Metrics(float("nan"), float("nan"), float("nan"))
     epoch_loss = running_loss / n_samples
     rmse = math.sqrt(running_sqerr / n_samples)
     mean_err = running_mean_err / n_samples
@@ -197,10 +205,13 @@ def evaluate(
 def build_dataloaders(
     dataset_path: Path,
     batch_size: int,
+    train_split: float,
     val_split: float,
+    test_split: float,
+    split_strategy: str,
     seed: int,
     overfit_n: int | None = None,
-) -> Tuple[DataLoader, DataLoader, Dict[str, torch.Tensor], Dict[str, List[int]]]:
+) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, Any], Dict[str, Any]]:
     """构建训练和验证 DataLoader。
 
     使用位置级切分协议：
@@ -213,41 +224,27 @@ def build_dataloaders(
     base_dataset = CFRDataset(dataset_path, preload=True)
     dataset_size = len(base_dataset)
 
-    # 获取位置信息和位置-样本映射
-    unique_pos_ids, pos_to_indices = base_dataset.unique_positions()
-    num_unique_positions = len(unique_pos_ids)
+    # 按 group 切分，主口径为 global_mobile_id（UE/location 级）。
+    group_ids = base_dataset.group_ids(split_strategy)
+    splits = split_indices_by_group(group_ids, train_split, val_split, test_split, seed)
 
-    # 按位置级切分：将位置（而非样本）分配到 train 或 val
-    # 使用受 seed 控制的 rng 确保切分可复现
-    shuffled_pos_ids = rng.permutation(unique_pos_ids)
-    num_val_positions = max(1, int(num_unique_positions * val_split))
-    num_train_positions = num_unique_positions - num_val_positions
-
-    train_positions: Set[int] = set(shuffled_pos_ids[:num_train_positions])
-    val_positions: Set[int] = set(shuffled_pos_ids[num_train_positions:])
-
-    # 根据位置分配样本索引
-    train_indices: List[int] = []
-    val_indices: List[int] = []
-
-    for pos_id in train_positions:
-        train_indices.extend(pos_to_indices[pos_id])
-    for pos_id in val_positions:
-        val_indices.extend(pos_to_indices[pos_id])
-
-    train_indices_tensor = torch.tensor(train_indices, dtype=torch.long)
-    val_indices_tensor = torch.tensor(val_indices, dtype=torch.long)
+    train_indices_tensor = torch.tensor(splits["train"], dtype=torch.long)
+    val_indices_tensor = torch.tensor(splits["val"], dtype=torch.long)
+    test_indices_tensor = torch.tensor(splits["test"], dtype=torch.long)
 
     print(f"数据集总样本数: {dataset_size}", flush=True)
-    print(f"唯一位置数: {num_unique_positions}", flush=True)
-    print(f"训练位置数: {num_train_positions}, 训练样本数: {len(train_indices)}", flush=True)
-    print(f"验证位置数: {num_val_positions}, 验证样本数: {len(val_indices)}", flush=True)
+    print(f"split_strategy: {split_strategy}", flush=True)
+    print(f"唯一 group 数: {len(np.unique(group_ids))}", flush=True)
+    print(f"训练样本数: {len(train_indices_tensor)}", flush=True)
+    print(f"验证样本数: {len(val_indices_tensor)}", flush=True)
+    print(f"测试样本数: {len(test_indices_tensor)}", flush=True)
 
     # Overfit mode (用于调试)
     if overfit_n is not None:
         overfit_n = min(overfit_n, train_indices_tensor.numel())
         train_indices_tensor = train_indices_tensor[:overfit_n]
         val_indices_tensor = train_indices_tensor.clone()
+        test_indices_tensor = train_indices_tensor.clone()
         print(f"[调试模式] 使用 {overfit_n} 个样本", flush=True)
 
     # 在训练集上计算归一化统计量
@@ -264,6 +261,7 @@ def build_dataloaders(
 
     train_subset = Subset(base_dataset, train_indices_tensor.tolist())
     val_subset = Subset(base_dataset, val_indices_tensor.tolist())
+    test_subset = Subset(base_dataset, test_indices_tensor.tolist())
 
     # DataLoader 使用独立的 torch Generator，与 numpy seed 分开
     torch_generator = torch.Generator().manual_seed(seed)
@@ -281,18 +279,27 @@ def build_dataloaders(
         shuffle=False,
         num_workers=0,
     )
+    test_loader = DataLoader(
+        test_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
 
-    stats = {"mean": mean.cpu(), "std": std.cpu()}
+    stats = {"mean": mean.cpu(), "std": std.cpu(), "label_dim": int(base_dataset.labels_tensor().shape[1])}
     split_info = {
         "train_indices": train_indices_tensor.tolist(),
         "val_indices": val_indices_tensor.tolist(),
-        "train_positions": list(train_positions),
-        "val_positions": list(val_positions),
-        "num_unique_positions": num_unique_positions,
+        "test_indices": test_indices_tensor.tolist(),
+        "split_strategy": split_strategy,
+        "group_ids": np.asarray(group_ids).astype(int).tolist(),
+        "num_unique_groups": int(np.unique(group_ids).size),
         "seed": seed,
+        "train_split": train_split,
         "val_split": val_split,
+        "test_split": test_split,
     }
-    return train_loader, val_loader, stats, split_info
+    return train_loader, val_loader, test_loader, stats, split_info
 
 
 def parse_args() -> argparse.Namespace:
@@ -307,7 +314,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=None, help="覆盖 optimizer.learning_rate")
     parser.add_argument("--weight-decay", type=float, default=None, help="覆盖 optimizer.weight_decay")
     parser.add_argument("--dropout", type=float, default=None, help="覆盖 model.dropout")
+    parser.add_argument("--output-dim", type=int, default=None, help="覆盖 model.output_dim")
+    parser.add_argument("--train-split", type=float, default=None, help="覆盖 data.train_split")
     parser.add_argument("--val-split", type=float, default=None, help="覆盖 data.val_split")
+    parser.add_argument("--test-split", type=float, default=None, help="覆盖 data.test_split")
+    parser.add_argument("--split-strategy", type=str, default=None, help="覆盖 data.split_strategy")
     parser.add_argument("--seed", type=int, default=None, help="覆盖 training.seed")
     parser.add_argument("--device", type=str, default=None, help="覆盖 training.device")
     parser.add_argument("--max-norm", type=float, default=None, help="覆盖 training.max_norm")
@@ -335,6 +346,21 @@ def parse_args() -> argparse.Namespace:
         help="覆盖 logging.save_loss_figure=false",
     )
     parser.set_defaults(save_loss_figure=None)
+
+    test_eval_group = parser.add_mutually_exclusive_group()
+    test_eval_group.add_argument(
+        "--evaluate-test-each-epoch",
+        dest="evaluate_test_each_epoch",
+        action="store_true",
+        help="覆盖 logging.evaluate_test_each_epoch=true",
+    )
+    test_eval_group.add_argument(
+        "--no-evaluate-test-each-epoch",
+        dest="evaluate_test_each_epoch",
+        action="store_false",
+        help="覆盖 logging.evaluate_test_each_epoch=false",
+    )
+    parser.set_defaults(evaluate_test_each_epoch=None)
 
     return parser.parse_args()
 
@@ -378,8 +404,16 @@ def apply_cli_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Non
         config["optimizer"]["weight_decay"] = args.weight_decay
     if args.dropout is not None:
         config["model"]["dropout"] = args.dropout
+    if args.output_dim is not None:
+        config["model"]["output_dim"] = args.output_dim
+    if args.train_split is not None:
+        config["data"]["train_split"] = args.train_split
     if args.val_split is not None:
         config["data"]["val_split"] = args.val_split
+    if args.test_split is not None:
+        config["data"]["test_split"] = args.test_split
+    if args.split_strategy is not None:
+        config["data"]["split_strategy"] = args.split_strategy
     if args.seed is not None:
         config["training"]["seed"] = args.seed
     if args.device is not None:
@@ -398,6 +432,8 @@ def apply_cli_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Non
         config["logging"]["save_loss_figure"] = bool(args.save_loss_figure)
     if args.loss_figure_name is not None:
         config["logging"]["loss_figure_name"] = args.loss_figure_name
+    if args.evaluate_test_each_epoch is not None:
+        config["logging"]["evaluate_test_each_epoch"] = bool(args.evaluate_test_each_epoch)
 
 
 def validate_and_normalize_config(config: Dict[str, Any]) -> None:
@@ -422,9 +458,12 @@ def validate_and_normalize_config(config: Dict[str, Any]) -> None:
     config["experiment"]["output_root"] = str(config["experiment"].get("output_root", "runs"))
     config["data"]["dataset"] = str(config["data"].get("dataset", "data/csi/csi_strict.h5"))
     config["data"]["split_strategy"] = str(config["data"].get("split_strategy", "position_level"))
+    config["data"]["train_split"] = float(config["data"].get("train_split", 1.0 - float(config["data"].get("val_split", 0.2)) - float(config["data"].get("test_split", 0.0))))
     config["data"]["val_split"] = float(config["data"].get("val_split", 0.2))
+    config["data"]["test_split"] = float(config["data"].get("test_split", 0.0))
 
     config["model"]["dropout"] = float(config["model"].get("dropout", 0.3))
+    config["model"]["output_dim"] = int(config["model"].get("output_dim", 2))
 
     config["optimizer"]["type"] = str(config["optimizer"].get("type", "AdamW"))
     config["optimizer"]["learning_rate"] = float(config["optimizer"].get("learning_rate", 1e-3))
@@ -446,6 +485,9 @@ def validate_and_normalize_config(config: Dict[str, Any]) -> None:
 
     config["logging"]["save_loss_figure"] = bool(config["logging"].get("save_loss_figure", True))
     config["logging"]["loss_figure_name"] = str(config["logging"].get("loss_figure_name", "loss_curve.png"))
+    config["logging"]["evaluate_test_each_epoch"] = bool(
+        config["logging"].get("evaluate_test_each_epoch", False)
+    )
 
     if config["training"]["epochs"] <= 0:
         raise ValueError("training.epochs 必须大于 0")
@@ -459,11 +501,21 @@ def validate_and_normalize_config(config: Dict[str, Any]) -> None:
         raise ValueError("loss.eps 必须大于 0")
 
     val_split = config["data"]["val_split"]
-    if not 0.0 < val_split < 1.0:
-        raise ValueError("data.val_split 必须在 (0, 1) 区间")
+    if not 0.0 <= val_split < 1.0:
+        raise ValueError("data.val_split 必须在 [0, 1) 区间")
+    train_split = config["data"]["train_split"]
+    test_split = config["data"]["test_split"]
+    if not 0.0 < train_split <= 1.0:
+        raise ValueError("data.train_split 必须在 (0, 1] 区间")
+    if not 0.0 <= test_split < 1.0:
+        raise ValueError("data.test_split 必须在 [0, 1) 区间")
+    if not np.isclose(train_split + val_split + test_split, 1.0):
+        raise ValueError("data.train_split + data.val_split + data.test_split 必须等于 1")
+    if config["model"]["output_dim"] <= 0:
+        raise ValueError("model.output_dim 必须大于 0")
 
     optimizer_type = config["optimizer"]["type"].lower()
-    if optimizer_type != "adamw":
+    if optimizer_type not in {"adam", "adamw"}:
         raise ValueError(f"暂不支持的优化器类型: {config['optimizer']['type']}")
 
     scheduler_type = config["scheduler"]["type"].lower()
@@ -523,8 +575,8 @@ def build_checkpoint_payload(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: StepLR,
-    stats: Dict[str, torch.Tensor],
-    split_info: Dict[str, List[int]],
+    stats: Dict[str, Any],
+    split_info: Dict[str, Any],
     effective_config: Dict[str, Any],
     best_val_rmse: float,
 ) -> Dict[str, Any]:
@@ -545,13 +597,18 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
     dataset_path = Path(config["data"]["dataset"])
     epochs = int(config["training"]["epochs"])
     batch_size = int(config["training"]["batch_size"])
+    train_split = float(config["data"]["train_split"])
     val_split = float(config["data"]["val_split"])
+    test_split = float(config["data"]["test_split"])
+    split_strategy = str(config["data"]["split_strategy"])
     dropout = float(config["model"]["dropout"])
+    output_dim = int(config["model"]["output_dim"])
     lr = float(config["optimizer"]["learning_rate"])
     weight_decay = float(config["optimizer"]["weight_decay"])
     max_norm = float(config["training"]["max_norm"])
     loss_eps = float(config["loss"]["eps"])
     use_amp = bool(config["training"]["amp"])
+    evaluate_test_each_epoch = bool(config["logging"].get("evaluate_test_each_epoch", False))
 
     checkpoints_dir = run_dir / "checkpoints"
     best_ckpt_path = checkpoints_dir / "best.pt"
@@ -583,29 +640,36 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
     if use_amp and device.type == "cuda":
         print("使用混合精度训练(AMP)", flush=True)
 
-    train_loader, val_loader, stats, split_info = build_dataloaders(
+    train_loader, val_loader, test_loader, stats, split_info = build_dataloaders(
         dataset_path,
         batch_size,
+        train_split,
         val_split,
+        test_split,
+        split_strategy,
         seed,
     )
 
     n_train = len(train_loader.dataset)
     n_val = len(val_loader.dataset)
-    print(f"样本数: 训练 = {n_train}, 验证 = {n_val}", flush=True)
+    n_test = len(test_loader.dataset)
+    print(f"样本数: 训练 = {n_train}, 验证 = {n_val}, 测试 = {n_test}", flush=True)
 
     in_channels = int(stats["mean"].shape[0])
     print(f"输入通道数: {in_channels}", flush=True)
+    print(f"输出维度: {output_dim}", flush=True)
+    if int(stats["label_dim"]) != output_dim:
+        raise ValueError(f"model.output_dim={output_dim} 与数据标签维度 {stats['label_dim']} 不一致")
 
-    model = MPRINet(dropout=dropout, in_channels=in_channels).to(device)
+    model = MPRINet(dropout=dropout, in_channels=in_channels, output_dim=output_dim).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"模型参数量: {n_params:,}", flush=True)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
+    optimizer_type = str(config["optimizer"]["type"]).lower()
+    if optimizer_type == "adam":
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = StepLR(
         optimizer,
         step_size=int(config["scheduler"]["step_size"]),
@@ -623,12 +687,15 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
         "val_loss",
         "val_rmse",
         "val_mean_err",
+        "test_loss",
+        "test_rmse",
+        "test_mean_err",
         "epoch_time_s",
         "is_best",
     ]
 
-    history = {"train_rmse": [], "val_rmse": []}
-    best_val_rmse = float("inf")
+    history = {"train_rmse": [], "val_rmse": [], "test_rmse": []}
+    best_selection_rmse = float("inf")
     best_epoch = 0
 
     writer = SummaryWriter(log_dir=str(tensorboard_dir))
@@ -652,11 +719,21 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
                     scaler,
                 )
                 val_metrics = evaluate(model, val_loader, device, loss_eps)
+                if evaluate_test_each_epoch and len(test_loader.dataset) > 0:
+                    test_metrics = evaluate(model, test_loader, device, loss_eps)
+                else:
+                    test_metrics = Metrics(float("nan"), float("nan"), float("nan"))
+                if len(val_loader.dataset) > 0:
+                    selection_metrics = val_metrics
+                elif evaluate_test_each_epoch and len(test_loader.dataset) > 0:
+                    selection_metrics = test_metrics
+                else:
+                    selection_metrics = train_metrics
 
                 duration = time.time() - start
-                is_best = val_metrics.rmse < best_val_rmse
+                is_best = selection_metrics.rmse < best_selection_rmse
                 if is_best:
-                    best_val_rmse = val_metrics.rmse
+                    best_selection_rmse = selection_metrics.rmse
                     best_epoch = epoch
                     torch.save(
                         build_checkpoint_payload(
@@ -667,7 +744,7 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
                             stats,
                             split_info,
                             effective_config,
-                            best_val_rmse,
+                            best_selection_rmse,
                         ),
                         best_ckpt_path,
                     )
@@ -682,6 +759,9 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
                         "val_loss": val_metrics.loss,
                         "val_rmse": val_metrics.rmse,
                         "val_mean_err": val_metrics.mean_err,
+                        "test_loss": test_metrics.loss,
+                        "test_rmse": test_metrics.rmse,
+                        "test_mean_err": test_metrics.mean_err,
                         "epoch_time_s": duration,
                         "is_best": int(is_best),
                     }
@@ -691,25 +771,35 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
                 writer.add_scalar("train/loss", train_metrics.loss, epoch)
                 writer.add_scalar("train/rmse", train_metrics.rmse, epoch)
                 writer.add_scalar("train/mean_error", train_metrics.mean_err, epoch)
-                writer.add_scalar("val/loss", val_metrics.loss, epoch)
-                writer.add_scalar("val/rmse", val_metrics.rmse, epoch)
-                writer.add_scalar("val/mean_error", val_metrics.mean_err, epoch)
+                if len(val_loader.dataset) > 0:
+                    writer.add_scalar("val/loss", val_metrics.loss, epoch)
+                    writer.add_scalar("val/rmse", val_metrics.rmse, epoch)
+                    writer.add_scalar("val/mean_error", val_metrics.mean_err, epoch)
+                if evaluate_test_each_epoch and len(test_loader.dataset) > 0:
+                    writer.add_scalar("test/loss", test_metrics.loss, epoch)
+                    writer.add_scalar("test/rmse", test_metrics.rmse, epoch)
+                    writer.add_scalar("test/mean_error", test_metrics.mean_err, epoch)
                 writer.add_scalar("train/lr", current_lr, epoch)
 
-                print(
+                message = (
                     f"[Epoch {epoch:03d}/{epochs:03d}] "
                     f"train_loss: {train_metrics.loss:.4f} | "
                     f"val_loss: {val_metrics.loss:.4f} | "
                     f"train_rmse: {train_metrics.rmse:.3f}m | "
                     f"val_rmse: {val_metrics.rmse:.3f}m | "
-                    f"val_mean_err: {val_metrics.mean_err:.3f}m | "
-                    f"lr: {current_lr:.6g} | "
-                    f"time: {duration:.1f}s",
-                    flush=True,
+                    f"val_mean_err: {val_metrics.mean_err:.3f}m"
                 )
+                if evaluate_test_each_epoch and len(test_loader.dataset) > 0:
+                    message += (
+                        f" | test_rmse: {test_metrics.rmse:.3f}m"
+                        f" | test_mean_err: {test_metrics.mean_err:.3f}m"
+                    )
+                message += f" | lr: {current_lr:.6g} | time: {duration:.1f}s"
+                print(message, flush=True)
 
                 history["train_rmse"].append(train_metrics.rmse)
                 history["val_rmse"].append(val_metrics.rmse)
+                history["test_rmse"].append(test_metrics.rmse)
 
                 scheduler.step()
 
@@ -723,8 +813,8 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
                 stats,
                 split_info,
                 effective_config,
-                best_val_rmse,
-            ),
+                    best_selection_rmse,
+                ),
             last_ckpt_path,
         )
     finally:
@@ -732,7 +822,13 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
         writer.close()
 
     print("\n=== 训练完成 ===", flush=True)
-    print(f"最佳验证 RMSE: {best_val_rmse:.3f}m (Epoch {best_epoch})", flush=True)
+    if len(val_loader.dataset) > 0:
+        selection_name = "验证"
+    elif evaluate_test_each_epoch and len(test_loader.dataset) > 0:
+        selection_name = "测试"
+    else:
+        selection_name = "训练"
+    print(f"最佳{selection_name} RMSE: {best_selection_rmse:.3f}m (Epoch {best_epoch})", flush=True)
     print(f"最佳模型: {best_ckpt_path}", flush=True)
     print(f"最终模型: {last_ckpt_path}", flush=True)
     print(f"指标文件: {metrics_csv_path}", flush=True)
@@ -750,6 +846,8 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
             plt.figure(figsize=(10, 6))
             plt.plot(epochs_axis, history["train_rmse"], label="Train RMSE", linewidth=1.5)
             plt.plot(epochs_axis, history["val_rmse"], label="Val RMSE", linewidth=1.5)
+            if evaluate_test_each_epoch and any(np.isfinite(history["test_rmse"])):
+                plt.plot(epochs_axis, history["test_rmse"], label="Test RMSE", linewidth=1.5)
             plt.xlabel("Epoch")
             plt.ylabel("Position RMSE (m)")
             plt.title("MPRI Training Curve")

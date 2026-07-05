@@ -1,396 +1,621 @@
 #!/usr/bin/env python3
-"""Sionna CFR → MPRI CSI 数据适配器。
-
-将 Sionna 输出的原始 CFR 复数向量转换为 MPRI 训练/评估脚本可直接读取的
-HDF5 数据格式，输出幅度-相位交织的 CSI 特征。
-
-输入格式 (Sionna):
-    channel/cfr: (num_aps, num_rx, num_tx_ant, num_rx_ant, num_sc) complex64
-    channel/has_signal: (num_aps, num_rx) bool
-    topology/rx_positions: (num_rx, 3) float32
-
-输出格式 (MPRI):
-    features: (W, H, C, N) float32
-        W = num_ant_pairs * 2  (幅度-相位交织)
-        H = num_subcarriers
-        C = num_aps
-        N = num_samples
-    labels/position: (N, 3) float32
-
-输出两个文件:
-    1. csi_strict.h5 — 仅保留所有 AP 都有信号的位置
-    2. csi_padded.h5 — 保留至少一个 AP 有信号的位置，缺失 AP 零填充
-"""
+"""Convert Front3D or DeepMIMO data into the MPRI CFR-image HDF5 contract."""
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
+from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 import h5py
 import numpy as np
+import yaml
+
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "dataset": {
+        "format": "front3d",
+        "root_env": "BASELINE_FRONT3D_ROOT",
+        "root": "../data/Front3d_2988_CFR_Only",
+        "scene_id": "front3d_5431",
+    },
+    "output_dir": "data/processed/front3d_5431",
+    "label_dims": 2,
+    "representation": "log_abs",
+    "eps": 1.0e-8,
+    "sample_limit": None,
+    "subcarriers": {"policy": "uniform", "count": 193},
+    "augmentation": {
+        "enabled": False,
+        "snr_db": [50.0, 20.0, 10.0],
+        "include_clean": False,
+        "seed": 2026,
+    },
+    "front3d": {"bs_ids": None, "max_bs": None},
+    "deepmimo": {
+        "key": "t003_tx000_r000",
+        "path_count": 16,
+        "bandwidth_hz": 100_000_000.0,
+    },
+    "outputs": {
+        "strict_name": "csi_strict_log_abs_193.h5",
+        "padded_name": "csi_padded_log_abs_193.h5",
+    },
+    "compression": "lzf",
+    "runs": {"root": "runs", "experiment_name": "convert_mpri"},
+}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="将 Sionna CFR 转换为 MPRI 可用的 CSI HDF5 数据集")
-    parser.add_argument(
-        "--input",
-        type=Path,
-        default=Path("data/raw"),
-        help="原始 Sionna HDF5 文件或目录（默认: data/raw）",
-    )
-    parser.add_argument(
-        "--glob",
-        type=str,
-        default="*.h5",
-        help="当 --input 是目录时，匹配输入文件的 glob 模式（默认: *.h5）",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("data/csi"),
-        help="输出目录（默认: data/csi）",
-    )
-    parser.add_argument(
-        "--strict-name",
-        type=str,
-        default="csi_strict.h5",
-        help="严格策略输出文件名（默认: csi_strict.h5）",
-    )
-    parser.add_argument(
-        "--padded-name",
-        type=str,
-        default="csi_padded.h5",
-        help="零填充策略输出文件名（默认: csi_padded.h5）",
-    )
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=512,
-        help="转换时每个 AP 的 RX 分块大小（默认: 512）",
-    )
-    parser.add_argument(
-        "--compression",
-        choices=["none", "lzf", "gzip"],
-        default="lzf",
-        help="输出 HDF5 压缩方式（默认: lzf）",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="若输出文件已存在则覆盖",
-    )
+    parser = argparse.ArgumentParser(description="Convert Front3D/DeepMIMO data for MPRI.")
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing processed files.")
     return parser.parse_args()
 
 
-def resolve_input_file(input_path: Path, pattern: str) -> Path:
-    """将输入路径解析为单个 HDF5 文件。"""
-    if input_path.is_file():
-        return input_path
-
-    if not input_path.exists():
-        raise FileNotFoundError(f"输入路径不存在: {input_path}")
-    if not input_path.is_dir():
-        raise ValueError(f"输入路径不是文件或目录: {input_path}")
-
-    matched = sorted(p for p in input_path.glob(pattern) if p.is_file())
-    if len(matched) == 0:
-        raise FileNotFoundError(f"目录 {input_path} 下未找到匹配 {pattern} 的文件")
-    if len(matched) > 1:
-        candidates = "\n".join(str(p) for p in matched)
-        raise ValueError(
-            "输入目录匹配到多个文件，请通过 --input 指定具体文件，或缩小 --glob:\n"
-            f"{candidates}"
-        )
-
-    return matched[0]
+def deep_update(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    out = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_update(out[key], value)
+        else:
+            out[key] = value
+    return out
 
 
-def load_raw_data(handle: h5py.File) -> Dict[str, Any]:
-    """从打开的 HDF5 文件加载原始 CFR 元信息。"""
-    required_keys = ["channel/cfr", "channel/has_signal", "topology/rx_positions"]
-    for key in required_keys:
-        if key not in handle:
-            raise KeyError(f"缺少必需数据集: {key}")
+def load_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Config not found: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        user_cfg = yaml.safe_load(handle) or {}
+    if not isinstance(user_cfg, dict):
+        raise ValueError("Config top level must be a mapping.")
+    cfg = deep_update(DEFAULT_CONFIG, _expand_env(user_cfg))
+    dataset = cfg.get("dataset")
+    if not isinstance(dataset, dict):
+        raise ValueError("dataset section is required.")
+    fmt = str(dataset.get("format", "")).strip().lower()
+    if fmt not in {"front3d", "deepmimo"}:
+        raise ValueError(f"Unsupported dataset.format: {fmt!r}; expected front3d or deepmimo.")
+    dataset["format"] = fmt
+    if fmt == "front3d":
+        dataset.pop("key", None)
+    else:
+        dataset.pop("scene_id", None)
+    dataset["root"] = str(_resolve_root(dataset))
+    cfg["label_dims"] = int(cfg["label_dims"])
+    cfg["representation"] = str(cfg["representation"])
+    if cfg["representation"] not in {"log_abs", "amp_phase", "real_imag"}:
+        raise ValueError(f"Unsupported representation: {cfg['representation']}")
+    cfg["eps"] = float(cfg["eps"])
+    cfg["compression"] = str(cfg.get("compression", "lzf"))
+    if cfg["compression"] not in {"lzf", "gzip", "none"}:
+        raise ValueError("compression must be lzf, gzip or none.")
+    cfg["subcarriers"]["count"] = int(cfg["subcarriers"]["count"])
+    cfg["subcarriers"]["policy"] = str(cfg["subcarriers"].get("policy", "uniform"))
+    if cfg["sample_limit"] is not None:
+        cfg["sample_limit"] = int(cfg["sample_limit"])
+    aug = cfg["augmentation"]
+    aug["enabled"] = bool(aug.get("enabled", False))
+    aug["include_clean"] = bool(aug.get("include_clean", False))
+    aug["seed"] = int(aug.get("seed", 2026))
+    aug["snr_db"] = [float(v) for v in aug.get("snr_db", [])]
+    if aug["enabled"] and not aug["snr_db"]:
+        raise ValueError("augmentation.snr_db must be non-empty when augmentation.enabled is true.")
+    cfg["deepmimo"]["path_count"] = int(cfg["deepmimo"].get("path_count", 16))
+    cfg["deepmimo"]["bandwidth_hz"] = float(cfg["deepmimo"].get("bandwidth_hz", 100_000_000.0))
+    return cfg
 
-    cfr = handle["channel/cfr"]  # h5py dataset, lazy read
-    has_signal = np.asarray(handle["channel/has_signal"], dtype=bool)
-    rx_positions = np.asarray(handle["topology/rx_positions"], dtype=np.float32)
 
+def _expand_env(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _expand_env(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_env(v) for v in value]
+    if isinstance(value, str):
+        return os.path.expandvars(value)
+    return value
+
+
+def _resolve_root(dataset: dict[str, Any]) -> Path:
+    root_env = dataset.get("root_env")
+    root = os.environ.get(str(root_env), "") if root_env else ""
+    root = root or str(dataset.get("root", "")).strip()
+    if not root:
+        raise ValueError(f"dataset.root or environment variable {root_env!r} is required.")
+    return Path(root)
+
+
+def make_run_dir(cfg: dict[str, Any]) -> Path:
+    root = Path(cfg.get("runs", {}).get("root", "runs")) / "convert"
+    root.mkdir(parents=True, exist_ok=True)
+    name = str(cfg.get("runs", {}).get("experiment_name", "convert_mpri"))
+    stamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    run_dir = root / f"{name}-{stamp}"
+    suffix = 1
+    while run_dir.exists():
+        run_dir = root / f"{name}-{stamp}-{suffix:02d}"
+        suffix += 1
+    run_dir.mkdir(parents=True)
+    return run_dir
+
+
+def input_files(cfg: dict[str, Any]) -> list[Path]:
+    dataset = cfg["dataset"]
+    root = Path(dataset["root"])
+    if dataset["format"] == "front3d":
+        scene_id = dataset.get("scene_id")
+        if scene_id:
+            path = root / "scenes" / f"{scene_id}.h5"
+            if not path.exists():
+                raise FileNotFoundError(f"Front3D scene not found: {path}")
+            return [path]
+        if root.is_file():
+            return [root]
+        files = sorted((root / "scenes").glob("*.h5")) if (root / "scenes").is_dir() else sorted(root.glob("*.h5"))
+        if not files:
+            raise FileNotFoundError(f"No Front3D .h5 files found under {root}")
+        return files
+    return [root]
+
+
+def choose_subcarriers(num_subcarriers: int, policy: str, count: int) -> np.ndarray:
+    if count <= 0:
+        raise ValueError("subcarriers.count must be positive.")
+    if count > num_subcarriers:
+        raise ValueError(f"subcarriers.count={count} exceeds available subcarriers {num_subcarriers}.")
+    if policy == "uniform":
+        return np.round(np.linspace(0, num_subcarriers - 1, count)).astype(np.int64)
+    if policy == "first":
+        return np.arange(count, dtype=np.int64)
+    raise ValueError(f"Unsupported subcarrier policy: {policy}")
+
+
+def augmentation_levels(cfg: dict[str, Any]) -> list[float | None]:
+    aug = cfg["augmentation"]
+    if not aug["enabled"]:
+        return [None]
+    levels: list[float | None] = []
+    if aug["include_clean"]:
+        levels.append(None)
+    levels.extend(float(v) for v in aug["snr_db"])
+    return levels
+
+
+def add_awgn(x: np.ndarray, snr_db: float | None, rng: np.random.Generator) -> np.ndarray:
+    if snr_db is None:
+        return x
+    signal_power = float(np.nanmean(np.abs(x) ** 2))
+    if not np.isfinite(signal_power) or signal_power <= 0.0:
+        return x
+    noise_power = signal_power / (10.0 ** (float(snr_db) / 10.0))
+    noise = np.sqrt(noise_power / 2.0) * (
+        rng.standard_normal(x.shape, dtype=np.float32) + 1j * rng.standard_normal(x.shape, dtype=np.float32)
+    )
+    return (x + noise.astype(np.complex64)).astype(np.complex64)
+
+
+def complex_to_feature(x: np.ndarray, indices: np.ndarray, representation: str, eps: float) -> np.ndarray:
+    selected = x[..., indices]
+    flat = selected.reshape(int(np.prod(selected.shape[:-1])), selected.shape[-1])
+    if representation == "log_abs":
+        return (20.0 * np.log10(np.abs(flat) + eps)).astype(np.float32)
+    if representation == "amp_phase":
+        out = np.empty((flat.shape[0] * 2, flat.shape[1]), dtype=np.float32)
+        out[0::2] = np.abs(flat)
+        out[1::2] = np.angle(flat)
+        return out
+    if representation == "real_imag":
+        out = np.empty((flat.shape[0] * 2, flat.shape[1]), dtype=np.float32)
+        out[0::2] = flat.real
+        out[1::2] = flat.imag
+        return out
+    raise ValueError(f"Unsupported representation: {representation}")
+
+
+def build_dataset(files: list[Path], cfg: dict[str, Any], require_all_anchors: bool) -> dict[str, np.ndarray]:
+    fmt = cfg["dataset"]["format"]
+    if fmt == "front3d":
+        return build_front3d_dataset(files, cfg, require_all_anchors)
+    if fmt == "deepmimo":
+        return build_deepmimo_dataset(Path(files[0]), cfg, require_all_anchors)
+    raise ValueError(f"Unsupported dataset format: {fmt}")
+
+
+def build_front3d_dataset(files: list[Path], cfg: dict[str, Any], require_all_anchors: bool) -> dict[str, np.ndarray]:
+    rng = np.random.default_rng(int(cfg["augmentation"]["seed"]))
+    levels = augmentation_levels(cfg)
+    features_parts: list[np.ndarray] = []
+    labels_parts: list[np.ndarray] = []
+    labels3d_parts: list[np.ndarray] = []
+    global_mobile_parts: list[np.ndarray] = []
+    local_mobile_parts: list[np.ndarray] = []
+    shard_parts: list[np.ndarray] = []
+    valid_parts: list[np.ndarray] = []
+    source_file_parts: list[np.ndarray] = []
+    snr_parts: list[np.ndarray] = []
+    subcarrier_indices: np.ndarray | None = None
+    selected_bs: np.ndarray | None = None
+
+    for shard_i, path in enumerate(files):
+        with h5py.File(path, "r") as f:
+            if "cfr" not in f or "target_xy" not in f:
+                raise ValueError(f"{path} is not a Front3D CFR-only scene file.")
+            cfr = np.asarray(f["cfr"])
+            labels = np.asarray(f["target_xy"], dtype=np.float32)
+            ue_ids = np.asarray(f["ue_id"] if "ue_id" in f else np.arange(cfr.shape[0]), dtype=np.int64)
+            bs_ids = np.asarray(f["bs_id"] if "bs_id" in f else np.zeros(cfr.shape[0], dtype=np.int64), dtype=np.int64)
+            valid = np.asarray(f["valid_mask"] if "valid_mask" in f else np.ones(cfr.shape[0], dtype=bool), dtype=bool)
+            if subcarrier_indices is None:
+                subcarrier_indices = choose_subcarriers(cfr.shape[-1], cfg["subcarriers"]["policy"], cfg["subcarriers"]["count"])
+            if selected_bs is None:
+                selected_bs = select_front3d_bs(bs_ids, cfg)
+            link_map = {(int(ue), int(bs)): i for i, (ue, bs) in enumerate(zip(ue_ids.tolist(), bs_ids.tolist()))}
+            ordered_ues = list(dict.fromkeys(int(v) for v in ue_ids.tolist()))
+            if cfg["sample_limit"] is not None:
+                ordered_ues = ordered_ues[: int(cfg["sample_limit"])]
+
+            rows: list[tuple[int, dict[int, int], np.ndarray]] = []
+            for ue in ordered_ues:
+                present = {int(bs): link_map[(ue, int(bs))] for bs in selected_bs.tolist() if (ue, int(bs)) in link_map}
+                present = {bs: idx for bs, idx in present.items() if bool(valid[idx])}
+                if require_all_anchors and len(present) != int(selected_bs.size):
+                    continue
+                if not present:
+                    continue
+                first_idx = next(iter(present.values()))
+                rows.append((ue, present, labels[first_idx, : cfg["label_dims"]]))
+            if not rows:
+                continue
+
+            sample0 = complex_to_feature(cfr[next(iter(rows[0][1].values()))], subcarrier_indices, cfg["representation"], cfg["eps"])
+            out_n = len(rows) * len(levels)
+            sample_features = np.zeros((sample0.shape[0], subcarrier_indices.size, selected_bs.size, out_n), dtype=np.float32)
+            sample_labels = np.zeros((out_n, cfg["label_dims"]), dtype=np.float32)
+            sample_labels3d = np.zeros((out_n, 3), dtype=np.float32)
+            sample_valid = np.zeros((out_n, selected_bs.size), dtype=np.uint8)
+            sample_global = np.zeros(out_n, dtype=np.int64)
+            sample_local = np.zeros(out_n, dtype=np.int64)
+            sample_snr = np.full(out_n, np.nan, dtype=np.float32)
+            out_i = 0
+            for local_i, (ue, present, label) in enumerate(rows):
+                for snr_db in levels:
+                    for anchor_i, bs in enumerate(selected_bs.tolist()):
+                        idx = present.get(int(bs))
+                        if idx is None:
+                            continue
+                        noisy = add_awgn(cfr[idx], snr_db, rng)
+                        sample_features[:, :, anchor_i, out_i] = complex_to_feature(
+                            noisy, subcarrier_indices, cfg["representation"], cfg["eps"]
+                        )
+                        sample_valid[out_i, anchor_i] = 1
+                    sample_labels[out_i] = label
+                    sample_labels3d[out_i, : cfg["label_dims"]] = label
+                    sample_global[out_i] = int(ue)
+                    sample_local[out_i] = int(local_i)
+                    if snr_db is not None:
+                        sample_snr[out_i] = float(snr_db)
+                    out_i += 1
+
+            features_parts.append(sample_features)
+            labels_parts.append(sample_labels)
+            labels3d_parts.append(sample_labels3d)
+            global_mobile_parts.append(sample_global)
+            local_mobile_parts.append(sample_local)
+            shard_parts.append(np.full(out_n, shard_i, dtype=np.int64))
+            valid_parts.append(sample_valid)
+            source_file_parts.append(np.asarray([path.name] * out_n, dtype=object))
+            snr_parts.append(sample_snr)
+
+    if not features_parts or subcarrier_indices is None or selected_bs is None:
+        raise ValueError("No Front3D samples were converted.")
+    return pack_output(
+        cfg,
+        features_parts,
+        labels_parts,
+        labels3d_parts,
+        global_mobile_parts,
+        local_mobile_parts,
+        shard_parts,
+        valid_parts,
+        source_file_parts,
+        snr_parts,
+        anchor_ids=selected_bs,
+        anchor_positions=np.zeros((selected_bs.size, 3), dtype=np.float32),
+        subcarrier_indices=subcarrier_indices,
+        layout={
+            "localized_side": "link",
+            "anchor_side": "bs",
+            "tx_role": "ue",
+            "rx_role": "bs",
+            "phy_link_direction": "uplink",
+        },
+    )
+
+
+def select_front3d_bs(bs_ids: np.ndarray, cfg: dict[str, Any]) -> np.ndarray:
+    requested = cfg.get("front3d", {}).get("bs_ids")
+    if requested:
+        values = np.asarray([int(v) for v in requested], dtype=np.int64)
+    else:
+        values = np.unique(bs_ids.astype(np.int64))
+    max_bs = cfg.get("front3d", {}).get("max_bs")
+    if max_bs is not None:
+        values = values[: int(max_bs)]
+    if values.size == 0:
+        raise ValueError("No Front3D BS ids selected.")
+    return values
+
+
+def build_deepmimo_dataset(root: Path, cfg: dict[str, Any], require_all_anchors: bool) -> dict[str, np.ndarray]:
+    del require_all_anchors
+    key = str(cfg["dataset"].get("key") or cfg.get("deepmimo", {}).get("key") or "t003_tx000_r000")
+    rx_pos = deepmimo_array(root, key, "rx_pos").astype(np.float32)
+    tx_pos = deepmimo_array(root, key, "tx_pos").astype(np.float32)
+    power_db = deepmimo_array(root, key, "power").astype(np.float32)
+    phase_deg = deepmimo_array(root, key, "phase").astype(np.float32)
+    delay_s = deepmimo_array(root, key, "delay").astype(np.float32)
+    n = int(rx_pos.shape[0])
+    if cfg["sample_limit"] is not None:
+        n = min(n, int(cfg["sample_limit"]))
+    path_count = int(cfg["deepmimo"]["path_count"])
+    subcarrier_indices = np.arange(int(cfg["subcarriers"]["count"]), dtype=np.int64)
+    freqs = np.linspace(
+        -0.5 * float(cfg["deepmimo"]["bandwidth_hz"]),
+        0.5 * float(cfg["deepmimo"]["bandwidth_hz"]),
+        subcarrier_indices.size,
+        dtype=np.float32,
+    )
+    rng = np.random.default_rng(int(cfg["augmentation"]["seed"]))
+    levels = augmentation_levels(cfg)
+    sample0 = deepmimo_virtual_cfr(power_db[0], phase_deg[0], delay_s[0], freqs, path_count)
+    sample0_feature = complex_to_feature(sample0, subcarrier_indices, cfg["representation"], cfg["eps"])
+    out_n = n * len(levels)
+    sample_features = np.zeros((sample0_feature.shape[0], subcarrier_indices.size, 1, out_n), dtype=np.float32)
+    sample_labels = np.zeros((out_n, cfg["label_dims"]), dtype=np.float32)
+    sample_labels3d = np.zeros((out_n, 3), dtype=np.float32)
+    sample_valid = np.ones((out_n, 1), dtype=np.uint8)
+    sample_global = np.zeros(out_n, dtype=np.int64)
+    sample_local = np.zeros(out_n, dtype=np.int64)
+    sample_snr = np.full(out_n, np.nan, dtype=np.float32)
+    out_i = 0
+    for i in range(n):
+        base = deepmimo_virtual_cfr(power_db[i], phase_deg[i], delay_s[i], freqs, path_count)
+        for snr_db in levels:
+            noisy = add_awgn(base, snr_db, rng)
+            sample_features[:, :, 0, out_i] = complex_to_feature(noisy, subcarrier_indices, cfg["representation"], cfg["eps"])
+            sample_labels[out_i] = rx_pos[i, : cfg["label_dims"]]
+            sample_labels3d[out_i] = rx_pos[i, :3]
+            sample_global[out_i] = i
+            sample_local[out_i] = i
+            if snr_db is not None:
+                sample_snr[out_i] = float(snr_db)
+            out_i += 1
+    return pack_output(
+        cfg,
+        [sample_features],
+        [sample_labels],
+        [sample_labels3d],
+        [sample_global],
+        [sample_local],
+        [np.zeros(out_n, dtype=np.int64)],
+        [sample_valid],
+        [np.asarray([f"deepmimo:{key}"] * out_n, dtype=object)],
+        [sample_snr],
+        anchor_ids=np.asarray([0], dtype=np.int64),
+        anchor_positions=tx_pos[:, :3].astype(np.float32),
+        subcarrier_indices=subcarrier_indices,
+        layout={
+            "localized_side": "rx",
+            "anchor_side": "tx",
+            "tx_role": "bs",
+            "rx_role": "ue",
+            "phy_link_direction": "downlink",
+        },
+    )
+
+
+def deepmimo_array(root: Path, key: str, field: str) -> np.ndarray:
+    try:
+        from scipy.io import loadmat
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("DeepMIMO conversion requires scipy; run `uv sync --extra dev`.") from exc
+    path = root / f"{field}_{key}.mat"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing DeepMIMO file: {path}")
+    data = loadmat(path, variable_names=[field])
+    if field not in data:
+        raise KeyError(f"Field {field!r} not found in {path}")
+    return np.asarray(data[field])
+
+
+def deepmimo_virtual_cfr(
+    power_db: np.ndarray,
+    phase_deg: np.ndarray,
+    delay_s: np.ndarray,
+    freqs: np.ndarray,
+    path_count: int,
+) -> np.ndarray:
+    valid = np.isfinite(power_db) & np.isfinite(phase_deg) & np.isfinite(delay_s)
+    order = np.argsort(np.where(valid, power_db, -np.inf))[::-1][:path_count]
+    out = np.zeros((path_count, freqs.size), dtype=np.complex64)
+    for out_i, path_i in enumerate(order.tolist()):
+        if not valid[path_i]:
+            continue
+        amp = np.sqrt(10.0 ** (float(power_db[path_i]) / 10.0))
+        phase0 = np.deg2rad(float(phase_deg[path_i]))
+        phase = phase0 - 2.0 * np.pi * freqs.astype(np.float64) * float(delay_s[path_i])
+        out[out_i] = (amp * np.exp(1j * phase)).astype(np.complex64)
+    return out
+
+
+def pack_output(
+    cfg: dict[str, Any],
+    features_parts: list[np.ndarray],
+    labels_parts: list[np.ndarray],
+    labels3d_parts: list[np.ndarray],
+    global_mobile_parts: list[np.ndarray],
+    local_mobile_parts: list[np.ndarray],
+    shard_parts: list[np.ndarray],
+    valid_parts: list[np.ndarray],
+    source_file_parts: list[np.ndarray],
+    snr_parts: list[np.ndarray],
+    *,
+    anchor_ids: np.ndarray,
+    anchor_positions: np.ndarray,
+    subcarrier_indices: np.ndarray,
+    layout: dict[str, str],
+) -> dict[str, np.ndarray]:
+    global_mobile = np.concatenate(global_mobile_parts, axis=0)
+    local_mobile = np.concatenate(local_mobile_parts, axis=0)
     return {
-        "cfr": cfr,
-        "has_signal": has_signal,
-        "rx_positions": rx_positions,
+        "features": np.concatenate(features_parts, axis=3),
+        "labels": np.concatenate(labels_parts, axis=0),
+        "labels3d": np.concatenate(labels3d_parts, axis=0),
+        "global_mobile_id": global_mobile,
+        "local_mobile_id": local_mobile,
+        "global_tx_id": global_mobile,
+        "local_tx_id": local_mobile,
+        "shard_index": np.concatenate(shard_parts, axis=0),
+        "valid_anchor_mask": np.concatenate(valid_parts, axis=0),
+        "source_file": np.concatenate(source_file_parts, axis=0),
+        "snr_db": np.concatenate(snr_parts, axis=0),
+        "anchor_positions_m": anchor_positions.astype(np.float32),
+        "global_anchor_ids": anchor_ids.astype(np.int64),
+        "subcarrier_indices": subcarrier_indices.astype(np.int64),
+        "layout": layout,
+        "dataset_format": np.asarray([cfg["dataset"]["format"]], dtype=object),
     }
 
 
-def validate_raw_data(data: Dict[str, Any]) -> None:
-    """检查输入数据形状是否符合预期。"""
-    cfr_shape = data["cfr"].shape
-    has_signal_shape = data["has_signal"].shape
-    rx_positions_shape = data["rx_positions"].shape
-
-    if len(cfr_shape) != 5:
-        raise ValueError(
-            "channel/cfr 维度错误，期望 (num_aps, num_rx, num_tx_ant, num_rx_ant, num_sc)，"
-            f"实际为 {cfr_shape}"
-        )
-
-    num_aps, num_rx, _, _, _ = cfr_shape
-    if has_signal_shape != (num_aps, num_rx):
-        raise ValueError(
-            "channel/has_signal 维度错误，"
-            f"期望 {(num_aps, num_rx)}，实际为 {has_signal_shape}"
-        )
-
-    if len(rx_positions_shape) != 2 or rx_positions_shape[0] != num_rx or rx_positions_shape[1] < 3:
-        raise ValueError(
-            "topology/rx_positions 维度错误，"
-            f"期望 ({num_rx}, >=3)，实际为 {rx_positions_shape}"
-        )
-
-
-def cfr_to_mp_interleaved(cfr: np.ndarray) -> np.ndarray:
-    """将复数 CFR 转换为幅度-相位交织格式
-
-    Args:
-        cfr: (num_rx, num_tx_ant, num_rx_ant, num_sc) complex64
-
-    Returns:
-        csi: (num_rx, num_sc, num_ant_pairs * 2) float32
-             沿最后一维: [amp_1, phase_1, amp_2, phase_2, ...]
-    """
-    num_rx, num_tx_ant, num_rx_ant, num_sc = cfr.shape
-    num_ant_pairs = num_tx_ant * num_rx_ant
-
-    # 展平天线维度: (num_rx, num_ant_pairs, num_sc)
-    cfr_flat = cfr.reshape(num_rx, num_ant_pairs, num_sc)
-
-    # 计算幅度和相位
-    amplitude = np.abs(cfr_flat)  # >= 0
-    phase = np.angle(cfr_flat)  # [-π, π]
-
-    # 交织: [amp_1, phase_1, amp_2, phase_2, ...]
-    csi = np.zeros((num_rx, num_ant_pairs * 2, num_sc), dtype=np.float32)
-    csi[:, 0::2, :] = amplitude  # 偶数索引: 幅度
-    csi[:, 1::2, :] = phase  # 奇数索引: 相位
-
-    # 转置为 (num_rx, num_sc, num_ant_pairs * 2) = (N, H, W)
-    csi = csi.transpose(0, 2, 1)
-    return csi
-
-
-def build_features(
-    data: Dict[str, Any],
-    rx_mask: np.ndarray,
-    zero_fill: bool = False,
-    chunk_size: int = 512,
-) -> tuple[np.ndarray, np.ndarray]:
-    """构建多 AP 合并的 CSI 特征和标签
-
-    Args:
-        data: 原始数据字典
-        rx_mask: 保留的 RX 位置掩码 (num_rx,)
-        zero_fill: True 时对缺失信号的 AP 填充零；False 时跳过该位置
-        chunk_size: 每次转换的 RX 分块大小
-
-    Returns:
-        features: (W, H, C, N) float32 — Fortran order
-        labels: (N, 3) float32
-    """
-    cfr = data["cfr"]
-    has_signal = data["has_signal"]
-    rx_positions = data["rx_positions"]
-    num_aps, _, num_tx_ant, num_rx_ant, num_sc = cfr.shape
-    num_ant_pairs = num_tx_ant * num_rx_ant
-    width = num_ant_pairs * 2
-
-    rx_indices = np.where(rx_mask)[0]
-    num_samples = int(rx_indices.shape[0])
-    positions = rx_positions[rx_indices, :3].astype(np.float32)
-
-    # 输出 shape: (W, H, C, N)
-    features = np.zeros((width, num_sc, num_aps, num_samples), dtype=np.float32)
-
-    if num_samples == 0:
-        return features, positions
-
-    if chunk_size <= 0:
-        raise ValueError(f"chunk_size 必须大于 0，当前值: {chunk_size}")
-
-    for ap_idx in range(num_aps):
-        if zero_fill:
-            local_indices = np.where(has_signal[ap_idx, rx_indices])[0]
-        else:
-            local_indices = np.arange(num_samples, dtype=np.int64)
-
-        if local_indices.size == 0:
-            continue
-
-        for start in range(0, local_indices.size, chunk_size):
-            local_chunk = local_indices[start : start + chunk_size]
-            rx_chunk = rx_indices[local_chunk]
-            cfr_chunk = np.asarray(cfr[ap_idx, rx_chunk], dtype=np.complex64)
-            csi_chunk = cfr_to_mp_interleaved(cfr_chunk)  # (chunk, H, W)
-
-            # (chunk, H, W) -> (W, H, chunk)
-            features[:, :, ap_idx, local_chunk] = csi_chunk.transpose(2, 1, 0)
-
-    return features, positions
+def save_output(path: Path, data: dict[str, np.ndarray], cfg: dict[str, Any], mode: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    compression = None if cfg["compression"] == "none" else cfg["compression"]
+    create_kwargs: dict[str, Any] = {"dtype": np.float32}
+    if compression is not None:
+        create_kwargs["compression"] = compression
+        if compression == "gzip":
+            create_kwargs["compression_opts"] = 4
+    str_dtype = h5py.string_dtype("utf-8")
+    with h5py.File(path, "w") as f:
+        f.create_dataset("features", data=data["features"], **create_kwargs)
+        labels = f.create_group("labels")
+        labels.create_dataset("position", data=data["labels"], **create_kwargs)
+        labels.create_dataset("position3d", data=data["labels3d"], **create_kwargs)
+        meta = f.create_group("metadata")
+        for key in [
+            "global_tx_id",
+            "local_tx_id",
+            "global_mobile_id",
+            "local_mobile_id",
+            "shard_index",
+            "valid_anchor_mask",
+            "anchor_positions_m",
+            "global_anchor_ids",
+            "subcarrier_indices",
+            "snr_db",
+        ]:
+            meta.create_dataset(key, data=data[key])
+        meta.create_dataset("source_file", data=data["source_file"].astype(str_dtype), dtype=str_dtype)
+        config = f.create_group("config")
+        layout = data["layout"]
+        attrs = {
+            "mode": mode,
+            "dataset_format": cfg["dataset"]["format"],
+            "dataset_root": cfg["dataset"]["root"],
+            "representation": cfg["representation"],
+            "label_dims": cfg["label_dims"],
+            "num_samples": int(data["labels"].shape[0]),
+            "num_anchors": int(data["features"].shape[2]),
+            "num_subcarriers": int(data["features"].shape[1]),
+            "feature_width": int(data["features"].shape[0]),
+            "augmentation_enabled": bool(cfg["augmentation"]["enabled"]),
+            "augmentation_snr_db": json.dumps(cfg["augmentation"]["snr_db"]),
+            "augmentation_note": "AWGN is applied to CFR/path-derived CFR as an adaptation of paper PHY-layer Filter_multipath noise.",
+            "localized_side": layout["localized_side"],
+            "anchor_side": layout["anchor_side"],
+            "tx_role": layout["tx_role"],
+            "rx_role": layout["rx_role"],
+            "phy_link_direction": layout["phy_link_direction"],
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        for key, value in attrs.items():
+            config.attrs[key] = value
 
 
-def save_output(
-    output_path: Path,
-    features: np.ndarray,
-    labels: np.ndarray,
-    config: Dict[str, Any] | None = None,
-    compression: str = "lzf",
-) -> None:
-    """保存为 MPRI 兼容的 HDF5 格式"""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    compression_arg = None if compression == "none" else compression
-
-    with h5py.File(output_path, "w") as f:
-        create_kwargs: Dict[str, Any] = {"dtype": np.float32}
-        if compression_arg is not None:
-            create_kwargs["compression"] = compression_arg
-            if compression_arg == "gzip":
-                create_kwargs["compression_opts"] = 4
-
-        f.create_dataset("features", data=features, **create_kwargs)
-        labels_group = f.create_group("labels")
-        labels_group.create_dataset("position", data=labels, **create_kwargs)
-        if config:
-            config_group = f.create_group("config")
-            for k, v in config.items():
-                config_group.attrs[k] = v
+def write_metadata_json(path: Path, data: dict[str, np.ndarray], cfg: dict[str, Any], mode: str) -> None:
+    payload = {
+        "mode": mode,
+        "dataset_format": cfg["dataset"]["format"],
+        "dataset_root": cfg["dataset"]["root"],
+        "dataset_scene_or_key": cfg["dataset"].get("scene_id") or cfg["dataset"].get("key") or cfg["deepmimo"].get("key"),
+        "representation": cfg["representation"],
+        "label_dims": cfg["label_dims"],
+        "feature_shape_whcn": [int(v) for v in data["features"].shape],
+        "label_shape": [int(v) for v in data["labels"].shape],
+        "subcarrier_policy": cfg["subcarriers"]["policy"],
+        "subcarrier_count": int(data["subcarrier_indices"].size),
+        "sample_count": int(data["labels"].shape[0]),
+        "unique_global_mobile_count": int(np.unique(data["global_mobile_id"]).size),
+        "global_anchor_ids": data["global_anchor_ids"].astype(int).tolist(),
+        "augmentation": cfg["augmentation"],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    path.with_suffix(".json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def main():
+def convert(cfg: dict[str, Any], overwrite: bool) -> Path:
+    files = input_files(cfg)
+    output_dir = Path(cfg["output_dir"])
+    strict_path = output_dir / cfg["outputs"]["strict_name"]
+    padded_path = output_dir / cfg["outputs"]["padded_name"]
+    for path in (strict_path, padded_path):
+        if path.exists() and not overwrite:
+            raise FileExistsError(f"Output file exists: {path}; use --overwrite")
+
+    run_dir = make_run_dir(cfg)
+    (run_dir / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+    report: dict[str, Any] = {
+        "dataset": cfg["dataset"],
+        "input_count": len(files),
+        "outputs": {},
+    }
+    for mode, require_all, path in (
+        ("strict", True, strict_path),
+        ("padded", False, padded_path),
+    ):
+        data = build_dataset(files, cfg, require_all_anchors=require_all)
+        save_output(path, data, cfg, mode)
+        write_metadata_json(path, data, cfg, mode)
+        report["outputs"][mode] = {
+            "path": str(path),
+            "features_shape_whcn": [int(v) for v in data["features"].shape],
+            "labels_shape": [int(v) for v in data["labels"].shape],
+            "unique_global_mobile_count": int(np.unique(data["global_mobile_id"]).size),
+            "num_anchors": int(data["features"].shape[2]),
+            "snr_levels": sorted({float(v) for v in data["snr_db"] if np.isfinite(v)}),
+        }
+
+    (run_dir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print(run_dir)
+    return run_dir
+
+
+def main() -> None:
     args = parse_args()
-
     try:
-        input_file = resolve_input_file(args.input, args.glob)
+        cfg = load_config(args.config)
+        convert(cfg, overwrite=args.overwrite)
     except Exception as exc:
-        print(f"错误: {exc}")
-        sys.exit(1)
-
-    strict_path = args.output_dir / args.strict_name
-    padded_path = args.output_dir / args.padded_name
-    for output_path in (strict_path, padded_path):
-        if output_path.exists() and not args.overwrite:
-            print(f"错误: 输出文件已存在: {output_path} (可加 --overwrite 覆盖)")
-            sys.exit(1)
-
-    print(f"加载原始数据: {input_file}")
-
-    with h5py.File(input_file, "r") as handle:
-        data = load_raw_data(handle)
-        validate_raw_data(data)
-
-        cfr = data["cfr"]
-        has_signal = data["has_signal"]
-        num_aps, num_rx, num_tx_ant, num_rx_ant, num_sc = cfr.shape
-        num_ant_pairs = num_tx_ant * num_rx_ant
-
-        print(f"  CFR shape: ({num_aps}, {num_rx}, {num_tx_ant}, {num_rx_ant}, {num_sc})")
-        print(f"  天线对数: {num_ant_pairs} -> W={num_ant_pairs * 2} (幅度-相位交织)")
-        print(f"  子载波数(Ns): {num_sc}")
-        print(f"  AP 数(Ng): {num_aps} -> C={num_aps}")
-        print()
-
-        # 统计各 AP 信号覆盖率
-        for ap_idx in range(num_aps):
-            valid = int(has_signal[ap_idx].sum())
-            if valid > 0:
-                first_valid_idx = int(np.where(has_signal[ap_idx])[0][0])
-                sample_mag = float(np.abs(cfr[ap_idx, first_valid_idx]).mean())
-                print(f"  AP{ap_idx}: {valid}/{num_rx} 有效, 示例幅度均值={sample_mag:.6f}")
-            else:
-                print(f"  AP{ap_idx}: 0/{num_rx} 有效")
-
-        strict_mask = has_signal.all(axis=0)  # 所有 AP 都有信号
-        padded_mask = has_signal.any(axis=0)  # 至少一个 AP 有信号
-        print(f"\n  所有 AP 都有信号: {int(strict_mask.sum())}")
-        print(f"  至少一个 AP 有信号: {int(padded_mask.sum())}")
-        print()
-
-        print("=" * 50)
-        print(f"生成文件 1: {strict_path.name} (严格策略)")
-        features_strict, labels_strict = build_features(
-            data,
-            strict_mask,
-            zero_fill=False,
-            chunk_size=args.chunk_size,
-        )
-        strict_samples = int(labels_strict.shape[0])
-        strict_config = {
-            "num_aps": int(features_strict.shape[2]),
-            "num_samples": strict_samples,
-            "num_subcarriers": int(features_strict.shape[1]),
-            "num_ant_pairs": int(num_ant_pairs),
-            "format": "mp_interleaved",
-            "mode": "strict",
-            "source_file": str(input_file),
-        }
-        save_output(
-            strict_path,
-            features_strict,
-            labels_strict,
-            config=strict_config,
-            compression=args.compression,
-        )
-        print(
-            "  features: "
-            f"(W={features_strict.shape[0]}, H={features_strict.shape[1]}, "
-            f"C={features_strict.shape[2]}, N={strict_samples})"
-        )
-        print(f"  labels: ({strict_samples}, 3)")
-
-        print()
-        print("=" * 50)
-        print(f"生成文件 2: {padded_path.name} (零填充策略)")
-        features_padded, labels_padded = build_features(
-            data,
-            padded_mask,
-            zero_fill=True,
-            chunk_size=args.chunk_size,
-        )
-        padded_samples = int(labels_padded.shape[0])
-
-        rx_indices = np.where(padded_mask)[0]
-        for ap_idx in range(num_aps):
-            filled = int((~has_signal[ap_idx, rx_indices]).sum())
-            print(f"  AP{ap_idx}: 零填充 {filled}/{padded_samples} 个位置")
-
-        padded_config = {
-            "num_aps": int(features_padded.shape[2]),
-            "num_samples": padded_samples,
-            "num_subcarriers": int(features_padded.shape[1]),
-            "num_ant_pairs": int(num_ant_pairs),
-            "format": "mp_interleaved",
-            "mode": "padded",
-            "source_file": str(input_file),
-        }
-        save_output(
-            padded_path,
-            features_padded,
-            labels_padded,
-            config=padded_config,
-            compression=args.compression,
-        )
-        print(
-            "  features: "
-            f"(W={features_padded.shape[0]}, H={features_padded.shape[1]}, "
-            f"C={features_padded.shape[2]}, N={padded_samples})"
-        )
-        print(f"  labels: ({padded_samples}, 3)")
-
-    print("\n转换完成!")
-    print(f"严格策略输出: {strict_path}")
-    print(f"零填充策略输出: {padded_path}")
+        print(f"Error: {exc}", file=sys.stderr)
+        raise
 
 
 if __name__ == "__main__":

@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
+from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
+from typing import Any
+
 import numpy as np
 import torch
+import yaml
 from torch import nn
 from torch.utils.data import DataLoader, Subset
 
@@ -11,215 +18,231 @@ from src.data import CFRDataset, NormalizeTransform
 from src.model import MPRINet
 
 
-import os
-import pathlib
-from pathlib import Path
-
-import torch
-
-def load_model(checkpoint_path: Path, device: torch.device) -> tuple[MPRINet, dict]:
-    """
-    加载模型 checkpoint，兼容 Linux 保存、Windows 加载时的 PosixPath 问题。
-    """
-    # 兼容：在 Windows 上加载 Linux 保存的 checkpoint（里面有 PosixPath）
-    if os.name == "nt":  # 'nt' 代表 Windows
-        _orig_posixpath = pathlib.PosixPath
-        try:
-            # 让 pickle 里记录的 PosixPath 反序列化成 WindowsPath
-            pathlib.PosixPath = pathlib.WindowsPath  # type: ignore[attr-defined]
-            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        finally:
-            # 恢复原来的 PosixPath，避免影响其他代码
-            pathlib.PosixPath = _orig_posixpath
-    else:
-        # Linux/macOS 正常加载
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-
-    stats = checkpoint.get("statistics")
-    in_channels = int(stats["mean"].shape[0])
-    config = checkpoint.get("config", {})
-
-    if isinstance(config, dict):
-        if "dropout" in config:
-            dropout = config.get("dropout", 0.3)
-        else:
-            model_cfg = config.get("model", {})
-            dropout = model_cfg.get("dropout", 0.3) if isinstance(model_cfg, dict) else 0.3
-    else:
-        dropout = 0.3
-
-    model = MPRINet(
-        dropout=float(dropout),
-        in_channels=in_channels,
-    )
-    model.load_state_dict(checkpoint["model_state"])
-    model.to(device)
-    model.eval()
-
-    return model, checkpoint
-
-@torch.no_grad()
-def evaluate_model(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-) -> dict:
-    criterion = nn.MSELoss()
-
-    losses = []
-    preds = []
-    targets = []
-
-    for inputs, labels in loader:
-        inputs = inputs.to(device)
-        labels = labels.to(device)
-
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-
-        losses.append(loss.detach().cpu())
-        preds.append(outputs.detach().cpu())
-        targets.append(labels.detach().cpu())
-
-    predictions = torch.cat(preds, dim=0)
-    ground_truth = torch.cat(targets, dim=0)
-    loss = torch.stack(losses).mean().item()
-
-    diff = predictions - ground_truth
-    per_sample_error = torch.linalg.norm(diff, dim=-1)
-    rmse = torch.sqrt(torch.mean(torch.sum(diff**2, dim=-1))).item()
-    mean_err = per_sample_error.mean().item()
-    median_err = per_sample_error.median().item()
-    p90_err = torch.quantile(per_sample_error, 0.9).item()
-
-    axis_mae = torch.mean(torch.abs(diff), dim=0).tolist()
-
-    return {
-        "loss": loss,
-        "rmse": rmse,
-        "mean_error": mean_err,
-        "median_error": median_err,
-        "p90_error": p90_err,
-        "axis_mae": axis_mae,
-        "predictions": predictions.numpy(),
-        "ground_truth": ground_truth.numpy(),
-        "per_sample_error": per_sample_error.numpy(),
-    }
+DEFAULT_CONFIG: dict[str, Any] = {
+    "experiment": {"name": "mpri_eval", "output_root": "runs/eval"},
+    "data": {"dataset": "data/processed/front3d_5431_smoke/csi_padded_log_abs_64_snr3.h5", "split": "test"},
+    "eval": {"batch_size": 64, "device": "cuda:0", "save_predictions": True},
+}
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate trained MPRI model.")
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=Path("checkpoints/mpri_model.pt"),
-        help="Path to the saved checkpoint.",
-    )
-    parser.add_argument(
-        "--dataset",
-        type=Path,
-        default=Path("data/csi/csi_strict.h5"),
-        help="Path to the HDF5 dataset file (prefer .h5).",
-    )
-    parser.add_argument(
-        "--split",
-        choices=["train", "val", "all"],
-        default="val",
-        help="Which split to evaluate. Uses indices stored in the checkpoint.",
-    )
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument(
-        "--save-errors",
-        type=Path,
-        default=None,
-        help="Optional path to save per-sample predictions and errors as .csv.",
-    )
-    parser.add_argument(
-        "--save-preds",
-        type=Path,
-        default=Path("results/predictions.csv"),
-        help="Path to save predictions with ground truth for the selected split (CSV).",
-    )
-    args = parser.parse_args()
+    parser.add_argument("--config", type=Path, default=Path("config/eval/default.yaml"))
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--dataset", type=Path, default=None)
+    parser.add_argument("--split", choices=["train", "val", "test", "all"], default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--device", type=str, default=None)
+    return parser.parse_args()
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    model, checkpoint = load_model(args.checkpoint, device)
 
+def deep_update(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_update(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"配置文件不存在: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        user_cfg = yaml.safe_load(handle) or {}
+    if not isinstance(user_cfg, dict):
+        raise ValueError("配置文件顶层必须是字典")
+    cfg = deep_update(DEFAULT_CONFIG, user_cfg)
+    cfg["experiment"]["name"] = str(cfg["experiment"].get("name", "mpri_eval"))
+    cfg["experiment"]["output_root"] = str(cfg["experiment"].get("output_root", "runs/eval"))
+    cfg["data"]["dataset"] = str(cfg["data"]["dataset"])
+    cfg["data"]["split"] = str(cfg["data"].get("split", "test"))
+    cfg["eval"]["batch_size"] = int(cfg["eval"].get("batch_size", 64))
+    cfg["eval"]["device"] = str(cfg["eval"].get("device", "cuda:0"))
+    cfg["eval"]["save_predictions"] = bool(cfg["eval"].get("save_predictions", True))
+    return cfg
+
+
+def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    if args.dataset is not None:
+        cfg["data"]["dataset"] = str(args.dataset)
+    if args.split is not None:
+        cfg["data"]["split"] = args.split
+    if args.batch_size is not None:
+        cfg["eval"]["batch_size"] = args.batch_size
+    if args.device is not None:
+        cfg["eval"]["device"] = args.device
+
+
+def make_run_dir(cfg: dict[str, Any]) -> Path:
+    root = Path(cfg["experiment"]["output_root"])
+    root.mkdir(parents=True, exist_ok=True)
+    name = cfg["experiment"]["name"]
+    stamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    run_dir = root / f"{name}-{stamp}"
+    suffix = 1
+    while run_dir.exists():
+        run_dir = root / f"{name}-{stamp}-{suffix:02d}"
+        suffix += 1
+    run_dir.mkdir(parents=True)
+    return run_dir
+
+
+def load_model(checkpoint_path: Path, device: torch.device) -> tuple[MPRINet, dict[str, Any]]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     stats = checkpoint.get("statistics")
     if stats is None:
         raise ValueError("Checkpoint does not contain normalisation statistics.")
+    config = checkpoint.get("config", {})
+    model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+    dropout = float(model_cfg.get("dropout", 0.3))
+    output_dim = int(model_cfg.get("output_dim", stats.get("label_dim", 2)))
+    in_channels = int(stats["mean"].shape[0])
+    model = MPRINet(dropout=dropout, in_channels=in_channels, output_dim=output_dim)
+    model.load_state_dict(checkpoint["model_state"])
+    model.to(device)
+    model.eval()
+    return model, checkpoint
 
-    dataset = CFRDataset(args.dataset, preload=True)
-    dataset.transform = NormalizeTransform(
-        torch.as_tensor(stats["mean"]), torch.as_tensor(stats["std"])
-    )
 
+@torch.no_grad()
+def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device) -> dict[str, Any]:
+    preds = []
+    targets = []
+    losses = []
+    criterion = nn.MSELoss()
+    for inputs, labels in loader:
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+        outputs = model(inputs)
+        losses.append(float(criterion(outputs, labels).cpu()))
+        preds.append(outputs.cpu())
+        targets.append(labels.cpu())
+    prediction = torch.cat(preds, dim=0)
+    truth = torch.cat(targets, dim=0)
+    diff = prediction - truth
+    err = torch.linalg.norm(diff, dim=-1)
+    metrics = {
+        "loss_mse": float(np.mean(losses)) if losses else 0.0,
+        "mean_error_m": float(err.mean()),
+        "median_error_m": float(err.median()),
+        "rmse_m": float(torch.sqrt(torch.mean(torch.sum(diff**2, dim=-1)))),
+        "p80_error_m": float(torch.quantile(err, 0.80)),
+        "p90_error_m": float(torch.quantile(err, 0.90)),
+        "p95_error_m": float(torch.quantile(err, 0.95)),
+        "valid_sample_count": int(err.numel()),
+        "axis_mae": torch.mean(torch.abs(diff), dim=0).numpy().tolist(),
+    }
+    return {
+        "metrics": metrics,
+        "predictions": prediction.numpy(),
+        "ground_truth": truth.numpy(),
+        "errors": err.numpy(),
+    }
+
+
+def split_indices(checkpoint: dict[str, Any], split: str, n: int) -> list[int]:
+    if split == "all":
+        return list(range(n))
     split_info = checkpoint.get("split")
-    if args.split == "all" or split_info is None:
-        indices = list(range(len(dataset)))
-    else:
-        key = f"{args.split}_indices"
-        if key not in split_info:
-            raise ValueError(f"Split '{args.split}' not found in checkpoint.")
-        indices = split_info[key]
+    if not isinstance(split_info, dict):
+        raise ValueError("Checkpoint does not contain split information.")
+    key = f"{split}_indices"
+    if key not in split_info:
+        raise ValueError(f"Split '{split}' not found in checkpoint.")
+    return [int(v) for v in split_info[key]]
 
-    subset = Subset(dataset, indices)
-    loader = DataLoader(subset, batch_size=args.batch_size, shuffle=False)
 
-    results = evaluate_model(model, loader, device)
+def write_metrics(path: Path, split: str, metrics: dict[str, Any]) -> None:
+    row = {"split": split, **{k: v for k, v in metrics.items() if k != "axis_mae"}}
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        writer.writeheader()
+        writer.writerow(row)
 
-    print("=== Evaluation Results (meters) ===")
-    print(f"Samples evaluated : {len(indices)}")
-    print(f"Loss (MSE)        : {results['loss']:.4f}")
-    print(f"RMSE              : {results['rmse']:.3f}")
-    print(f"Mean Error        : {results['mean_error']:.3f}")
-    print(f"Median Error      : {results['median_error']:.3f}")
-    print(f"90th Percentile   : {results['p90_error']:.3f}")
-    print(
-        "Axis MAE (|dx|, |dy|, |dz|): "
-        f"{results['axis_mae'][0]:.3f}, {results['axis_mae'][1]:.3f}, {results['axis_mae'][2]:.3f} m"
-    )
 
-    errors = results["per_sample_error"]
+def write_predictions(path: Path, dataset: CFRDataset, indices: list[int], result: dict[str, Any]) -> None:
+    gt = result["ground_truth"]
+    pred = result["predictions"]
+    err = result["errors"]
+    global_mobile = dataset.metadata_array("global_mobile_id")
+    local_mobile = dataset.metadata_array("local_mobile_id")
+    if global_mobile is None:
+        global_mobile = dataset.metadata_array("global_tx_id")
+    if local_mobile is None:
+        local_mobile = dataset.metadata_array("local_tx_id")
+    shard = dataset.metadata_array("shard_index")
+    source_file = dataset.metadata_array("source_file")
+    attrs = dataset.attrs()
+    fieldnames = [
+        "sample_index",
+        "global_mobile_id",
+        "shard_index",
+        "local_mobile_id",
+        "localized_side",
+        "anchor_side",
+        "source_file",
+    ]
+    dims = gt.shape[1]
+    fieldnames.extend([f"true_{axis}" for axis in ["x_m", "y_m", "z_m"][:dims]])
+    fieldnames.extend([f"pred_{axis}" for axis in ["x_m", "y_m", "z_m"][:dims]])
+    fieldnames.append("error_m")
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for out_i, sample_index in enumerate(indices):
+            row = {
+                "sample_index": sample_index,
+                "global_mobile_id": int(global_mobile[sample_index]) if global_mobile is not None else sample_index,
+                "shard_index": int(shard[sample_index]) if shard is not None else "",
+                "local_mobile_id": int(local_mobile[sample_index]) if local_mobile is not None else "",
+                "localized_side": str(attrs.get("localized_side", "")),
+                "anchor_side": str(attrs.get("anchor_side", "")),
+                "source_file": _decode(source_file[sample_index]) if source_file is not None else "",
+                "error_m": float(err[out_i]),
+            }
+            for dim, name in enumerate(["x_m", "y_m", "z_m"][:dims]):
+                row[f"true_{name}"] = float(gt[out_i, dim])
+                row[f"pred_{name}"] = float(pred[out_i, dim])
+            writer.writerow(row)
 
-    print("\n=== Error Statistics ===")
-    mean_err = float(np.mean(errors))
-    median_err = float(np.median(errors))
-    p90_err = float(np.quantile(errors, 0.9))
-    print(
-        f"Mean Error: {mean_err:.3f} m, "
-        f"Median Error: {median_err:.3f} m, "
-        f"P90 Error: {p90_err:.3f} m"
-    )
 
-    if args.save_errors:
-        args.save_errors.parent.mkdir(parents=True, exist_ok=True)
-        data = np.hstack(
-            [
-                results["ground_truth"],
-                results["predictions"],
-                results["per_sample_error"].reshape(-1, 1),
-            ]
-        )
-        header = "x_true,y_true,z_true,x_pred,y_pred,z_pred,error_m"
-        np.savetxt(args.save_errors, data, delimiter=",", header=header, comments="")
-        print(f"详细误差已保存至 {args.save_errors}")
+def _decode(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
 
-    if args.save_preds:
-        args.save_preds.parent.mkdir(parents=True, exist_ok=True)
-        idx_col = np.asarray(indices, dtype=np.int64).reshape(-1, 1)
-        combined = np.hstack(
-            [
-                idx_col,
-                results["ground_truth"],
-                results["predictions"],
-                results["per_sample_error"].reshape(-1, 1),
-            ]
-        )
-        header = "index,x_true,y_true,z_true,x_pred,y_pred,z_pred,error_m"
-        np.savetxt(args.save_preds, combined, delimiter=",", header=header, comments="")
-        print(f"预测与真值已保存至 {args.save_preds}")
+
+def main() -> None:
+    args = parse_args()
+    cfg = load_config(args.config)
+    apply_overrides(cfg, args)
+    run_dir = make_run_dir(cfg)
+    effective = deepcopy(cfg)
+    effective["runtime"] = {
+        "checkpoint": str(args.checkpoint),
+        "run_dir": str(run_dir),
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    (run_dir / "config.yaml").write_text(yaml.safe_dump(effective, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+    requested_device = cfg["eval"]["device"]
+    device = torch.device(requested_device if torch.cuda.is_available() else "cpu")
+    model, checkpoint = load_model(args.checkpoint, device)
+    stats = checkpoint["statistics"]
+    dataset = CFRDataset(cfg["data"]["dataset"], preload=True)
+    dataset.transform = NormalizeTransform(torch.as_tensor(stats["mean"]), torch.as_tensor(stats["std"]))
+    indices = split_indices(checkpoint, cfg["data"]["split"], len(dataset))
+    loader = DataLoader(Subset(dataset, indices), batch_size=cfg["eval"]["batch_size"], shuffle=False)
+    result = evaluate_model(model, loader, device)
+    metrics = result["metrics"]
+    metrics["axis_mae_json"] = json.dumps(metrics.pop("axis_mae"))
+    write_metrics(run_dir / "metrics.csv", cfg["data"]["split"], metrics)
+    if cfg["eval"]["save_predictions"]:
+        write_predictions(run_dir / "predictions.csv", dataset, indices, result)
+    print(json.dumps({"split": cfg["data"]["split"], **metrics}, ensure_ascii=False, indent=2))
+    print(run_dir)
 
 
 if __name__ == "__main__":

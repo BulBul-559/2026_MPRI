@@ -1,0 +1,12 @@
+experiment:
+  name: mpri_deepmimo_o1_3p5_smoke_eval
+  output_root: runs/eval
+
+data:
+  dataset: data/processed/deepmimo_o1_3p5_smoke/csi_padded_amp_phase_64_snr3.h5
+  split: test
+
+eval:
+  batch_size: 64
+  device: cpu
+  save_predictions: true
