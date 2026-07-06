@@ -102,6 +102,7 @@ def main() -> None:
     write_single_scene_splits(output_root, source_root, args.single_scene_split_id, scene_ids, args.snr_db)
     write_link_index(output_root, scene_ids, args.snr_db)
     write_readme(output_root, source_root, args, scene_summaries)
+    write_build_status(output_root, source_root, args, scene_summaries)
     print(json.dumps(build_final_report(output_root, source_root, args, scene_summaries), indent=2), flush=True)
 
 
@@ -479,10 +480,9 @@ def write_expanded_scene_link_plan(
     record_index = source["record_index"].to(torch.long)
     local_index = source["local_link_index"].to(torch.long)
     snr_count = len(snr_db)
-    scene_rows = record_index.tolist()
     out_local = expand_indices(local_index, snr_count)
     out_record = repeat_tensor(record_index, snr_count)
-    csi = csi_for_expanded_scene_plan(output_root, source_split_id, scene_rows, out_local.tolist())
+    csi = csi_for_expanded_scene_plan(output_root, source_split_id, out_record.tolist(), out_local.tolist())
     out = expand_link_plan_common(source, snr_db, split="test")
     out["record_index"] = out_record
     out["local_link_index"] = out_local
@@ -520,6 +520,11 @@ def csi_for_expanded_scene_plan(
     scene_rows: list[int],
     local_indices: list[int],
 ) -> np.ndarray:
+    if len(scene_rows) != len(local_indices):
+        raise ValueError(
+            "expanded scene row and local index arrays must have the same length: "
+            f"{len(scene_rows)} != {len(local_indices)}"
+        )
     scene_ids = read_lines(output_root / "splits" / source_split_id / "test_scenes.txt")
     result = np.empty(len(local_indices), dtype=np.float32)
     by_scene: dict[int, list[tuple[int, int]]] = {}
@@ -850,6 +855,68 @@ Noisy links: {sum(item['num_links'] for item in scene_summaries)}
 Static `assets/` and `obj/` directories are symlinks to the source dataset.
 """
     (output_root / "README.md").write_text(text, encoding="utf-8")
+
+
+def write_build_status(
+    output_root: Path,
+    source_root: Path,
+    args: argparse.Namespace,
+    scene_summaries: list[dict[str, Any]],
+) -> None:
+    rows = []
+    for scene_order, item in enumerate(scene_summaries, start=1):
+        h5_path = output_root / item["h5_path"]
+        tmp_path = h5_path.with_suffix(h5_path.suffix + ".tmp")
+        rows.append(
+            {
+                "scene_order": scene_order,
+                "scene_id": item["scene_id"],
+                "status": item.get("status", "completed"),
+                "h5_path": str(h5_path),
+                "tmp_path": str(tmp_path) if tmp_path.exists() else "",
+                "size_bytes": int(item["output_bytes"]),
+                "source_num_links": int(item["source_num_links"]),
+                "num_links": int(item["num_links"]),
+                "noise_snr_count": len(args.snr_db),
+                "error": "",
+            }
+        )
+    write_csv(output_root / "build_status.csv", rows)
+
+    report = build_final_report(output_root, source_root, args, scene_summaries)
+    tmp_count = sum(1 for path in (output_root / "scenes").glob("*.tmp"))
+    state = "complete" if tmp_count == 0 else "incomplete"
+    text = f"""# Noise Sub Test Set Build Status
+
+Last updated: {now_iso()}
+
+This offline noisy subset is currently **{state}** for the `{args.source_split_id}` test scenes from `Front3d_2988_CFR_Only`.
+
+## Current State
+
+- Target scene count: {report["scene_count"]}
+- Completed scenes: {len(scene_summaries)}
+- Missing scenes: 0
+- Failed scenes: 0
+- Interrupted temporary files: {tmp_count}
+- Source links: {report["source_num_links"]}
+- Noisy links: {report["num_links"]}
+- Noise SNR count: {len(args.snr_db)}
+
+## Files
+
+- Build script: `scripts/build_front3d_noise_subset.py`
+- Status CSV: `build_status.csv`
+- Manifest: `manifest.json`
+- Link index: `link_index.pt`
+
+## Resume Command
+
+```bash
+python scripts/build_front3d_noise_subset.py --source-root {source_root} --output-root {output_root} --source-split-id {args.source_split_id} --single-scene-split-id {args.single_scene_split_id} --snr-db {" ".join(str(float(v)) for v in args.snr_db)} --seed {args.seed} --chunk-links {args.chunk_links}
+```
+"""
+    (output_root / "BUILD_STATUS.md").write_text(text, encoding="utf-8")
 
 
 def write_split_readme(path: Path, summary: str) -> None:
