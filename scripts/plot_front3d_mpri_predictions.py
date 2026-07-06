@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +23,7 @@ from matplotlib.patches import FancyArrowPatch
 from PIL import Image
 
 
-SCENE_ROOT = Path("/data/sunmeiyuan/projects/SceneGen/front3d_full_all_6813_20260617_215824")
+DEFAULT_SCENE_ROOT = Path("../data/Front3d_2988_CFR_Only")
 DEFAULT_SCENES: list[str] = []
 DEFAULT_EVAL_RUNS: dict[str, Path] = {}
 
@@ -67,7 +68,12 @@ class PlotCase:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot MPRI prediction arrows on Front3D floorplans.")
-    parser.add_argument("--scene-root", type=Path, default=SCENE_ROOT)
+    parser.add_argument(
+        "--scene-root",
+        type=Path,
+        default=Path(os.environ.get("BASELINE_FRONT3D_SCENE_ROOT", os.environ.get("BASELINE_FRONT3D_ROOT", DEFAULT_SCENE_ROOT))),
+        help="Front3D floorplan root. Defaults to BASELINE_FRONT3D_SCENE_ROOT, then BASELINE_FRONT3D_ROOT, then ../data/Front3d_2988_CFR_Only.",
+    )
     parser.add_argument("--scenes", nargs="+", default=DEFAULT_SCENES)
     parser.add_argument(
         "--output-dir",

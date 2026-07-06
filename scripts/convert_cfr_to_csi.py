@@ -251,29 +251,29 @@ def build_front3d_dataset(files: list[Path], cfg: dict[str, Any], require_all_an
             ue_ids = np.asarray(f["ue_id"] if "ue_id" in f else np.arange(cfr.shape[0]), dtype=np.int64)
             bs_ids = np.asarray(f["bs_id"] if "bs_id" in f else np.zeros(cfr.shape[0], dtype=np.int64), dtype=np.int64)
             valid = np.asarray(f["valid_mask"] if "valid_mask" in f else np.ones(cfr.shape[0], dtype=bool), dtype=bool)
+            noise_level = np.asarray(f["noise/noise_level_index"], dtype=np.int64) if "noise/noise_level_index" in f else None
+            source_snr = np.asarray(f["noise/snr_db"], dtype=np.float32) if "noise/snr_db" in f else None
             if subcarrier_indices is None:
                 subcarrier_indices = choose_subcarriers(cfr.shape[-1], cfg["subcarriers"]["policy"], cfg["subcarriers"]["count"])
             if selected_bs is None:
                 selected_bs = select_front3d_bs(bs_ids, cfg)
-            link_map = {(int(ue), int(bs)): i for i, (ue, bs) in enumerate(zip(ue_ids.tolist(), bs_ids.tolist()))}
-            ordered_ues = list(dict.fromkeys(int(v) for v in ue_ids.tolist()))
-            if cfg["sample_limit"] is not None:
-                ordered_ues = ordered_ues[: int(cfg["sample_limit"])]
-
-            rows: list[tuple[int, dict[int, int], np.ndarray]] = []
-            for ue in ordered_ues:
-                present = {int(bs): link_map[(ue, int(bs))] for bs in selected_bs.tolist() if (ue, int(bs)) in link_map}
-                present = {bs: idx for bs, idx in present.items() if bool(valid[idx])}
-                if require_all_anchors and len(present) != int(selected_bs.size):
-                    continue
-                if not present:
-                    continue
-                first_idx = next(iter(present.values()))
-                rows.append((ue, present, labels[first_idx, : cfg["label_dims"]]))
+            rows: list[tuple[int, dict[int, int], np.ndarray, float | None]] = front3d_sample_rows(
+                labels,
+                ue_ids,
+                bs_ids,
+                valid,
+                selected_bs,
+                cfg,
+                require_all_anchors=require_all_anchors,
+                noise_level=noise_level,
+                source_snr=source_snr,
+            )
             if not rows:
                 continue
 
-            sample0 = complex_to_feature(cfr[next(iter(rows[0][1].values()))], subcarrier_indices, cfg["representation"], cfg["eps"])
+            sample0 = complex_to_feature(
+                cfr[next(iter(rows[0][1].values()))], subcarrier_indices, cfg["representation"], cfg["eps"]
+            )
             out_n = len(rows) * len(levels)
             sample_features = np.zeros((sample0.shape[0], subcarrier_indices.size, selected_bs.size, out_n), dtype=np.float32)
             sample_labels = np.zeros((out_n, cfg["label_dims"]), dtype=np.float32)
@@ -283,7 +283,7 @@ def build_front3d_dataset(files: list[Path], cfg: dict[str, Any], require_all_an
             sample_local = np.zeros(out_n, dtype=np.int64)
             sample_snr = np.full(out_n, np.nan, dtype=np.float32)
             out_i = 0
-            for local_i, (ue, present, label) in enumerate(rows):
+            for local_i, (ue, present, label, row_snr) in enumerate(rows):
                 for snr_db in levels:
                     for anchor_i, bs in enumerate(selected_bs.tolist()):
                         idx = present.get(int(bs))
@@ -298,7 +298,9 @@ def build_front3d_dataset(files: list[Path], cfg: dict[str, Any], require_all_an
                     sample_labels3d[out_i, : cfg["label_dims"]] = label
                     sample_global[out_i] = int(ue)
                     sample_local[out_i] = int(local_i)
-                    if snr_db is not None:
+                    if row_snr is not None and np.isfinite(row_snr):
+                        sample_snr[out_i] = float(row_snr)
+                    elif snr_db is not None:
                         sample_snr[out_i] = float(snr_db)
                     out_i += 1
 
@@ -336,6 +338,89 @@ def build_front3d_dataset(files: list[Path], cfg: dict[str, Any], require_all_an
             "phy_link_direction": "uplink",
         },
     )
+
+
+def front3d_sample_rows(
+    labels: np.ndarray,
+    ue_ids: np.ndarray,
+    bs_ids: np.ndarray,
+    valid: np.ndarray,
+    selected_bs: np.ndarray,
+    cfg: dict[str, Any],
+    *,
+    require_all_anchors: bool,
+    noise_level: np.ndarray | None = None,
+    source_snr: np.ndarray | None = None,
+) -> list[tuple[int, dict[int, int], np.ndarray, float | None]]:
+    if noise_level is None:
+        link_map = {(int(ue), int(bs)): i for i, (ue, bs) in enumerate(zip(ue_ids.tolist(), bs_ids.tolist()))}
+        ordered_ues = list(dict.fromkeys(int(v) for v in ue_ids.tolist()))
+        if cfg["sample_limit"] is not None:
+            ordered_ues = ordered_ues[: int(cfg["sample_limit"])]
+        rows = []
+        for ue in ordered_ues:
+            present = {int(bs): link_map[(ue, int(bs))] for bs in selected_bs.tolist() if (ue, int(bs)) in link_map}
+            present = {bs: idx for bs, idx in present.items() if bool(valid[idx])}
+            append_front3d_row(
+                rows,
+                ue,
+                present,
+                labels,
+                selected_bs,
+                require_all_anchors,
+                label_dims=int(cfg["label_dims"]),
+                source_snr=None,
+            )
+        return rows
+
+    link_map = {
+        (int(ue), int(level), int(bs)): i
+        for i, (ue, level, bs) in enumerate(zip(ue_ids.tolist(), noise_level.tolist(), bs_ids.tolist()))
+    }
+    ordered_pairs = list(dict.fromkeys((int(ue), int(level)) for ue, level in zip(ue_ids.tolist(), noise_level.tolist())))
+    if cfg["sample_limit"] is not None:
+        ordered_pairs = ordered_pairs[: int(cfg["sample_limit"])]
+    rows = []
+    for ue, level in ordered_pairs:
+        present = {
+            int(bs): link_map[(ue, level, int(bs))]
+            for bs in selected_bs.tolist()
+            if (ue, level, int(bs)) in link_map
+        }
+        present = {bs: idx for bs, idx in present.items() if bool(valid[idx])}
+        row_snr = None
+        if source_snr is not None and present:
+            row_snr = float(source_snr[next(iter(present.values()))])
+        append_front3d_row(
+            rows,
+            ue,
+            present,
+            labels,
+            selected_bs,
+            require_all_anchors,
+            label_dims=int(cfg["label_dims"]),
+            source_snr=row_snr,
+        )
+    return rows
+
+
+def append_front3d_row(
+    rows: list[tuple[int, dict[int, int], np.ndarray, float | None]],
+    ue: int,
+    present: dict[int, int],
+    labels: np.ndarray,
+    selected_bs: np.ndarray,
+    require_all_anchors: bool,
+    *,
+    label_dims: int,
+    source_snr: float | None,
+) -> None:
+    if require_all_anchors and len(present) != int(selected_bs.size):
+        return
+    if not present:
+        return
+    first_idx = next(iter(present.values()))
+    rows.append((ue, present, labels[first_idx, :label_dims], source_snr))
 
 
 def select_front3d_bs(bs_ids: np.ndarray, cfg: dict[str, Any]) -> np.ndarray:

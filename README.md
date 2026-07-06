@@ -26,63 +26,26 @@ Confirmed from the paper:
 
 Not fully specified in the paper and still tracked for review: optimizer details, batch size, and the exact DeepMIMO path-parameter-to-CFR synthesis contract.
 
-## Environment
+## Front3D Noisy Workflow
+
+The paper uses SNR augmentation at `50/20/10 dB`. For Front3D, the current reproducible adaptation is an offline noisy dataset that expands each CFR link once per SNR level:
 
 ```bash
-uv sync --extra dev
+BASELINE_FRONT3D_ROOT=/path/to/Front3d_2988_CFR_Only \
+.venv/bin/python scripts/build_front3d_noise_subset.py --chunk-links 1024
 ```
 
-If the PyTorch index is unreachable, the existing project venv can still be used after installing SciPy:
+By default, the script writes to `$BASELINE_FRONT3D_ROOT/noise_sub_test_set`. Override with `BASELINE_FRONT3D_NOISE_ROOT` or `--output-root`. The generated `manifest.json` is authoritative only after the builder completes all selected scenes; interrupted `.h5.tmp` files are not part of the dataset contract.
 
-```bash
-uv pip install --python .venv/bin/python -i https://pypi.tuna.tsinghua.edu.cn/simple "scipy>=1.15"
-```
+## Single-Scene 400-Epoch Evidence
 
-## Data Check And Conversion
+The current local paper-style smoke/formal check uses one prepared noisy scene, `front3d_0015`, with `400` epochs and the paper-style LR schedule. These `runs/` artifacts are local and are not committed.
 
-Front3D smoke:
+| Input | Best checkpoint test mean / median / P95 / RMSE | Last checkpoint test mean / median / P95 / RMSE | Training time |
+|---|---|---|---|
+| 193 subcarriers | `0.572 / 0.480 / 1.279 / 0.690 m` at epoch 25 | `0.577 / 0.425 / 1.573 / 0.817 m` at epoch 400 | `6:47.28` |
+| Raw 768 subcarriers | `0.558 / 0.458 / 1.333 / 0.687 m` at epoch 26 | `0.603 / 0.449 / 1.522 / 0.812 m` at epoch 400 | `21:52.69` |
 
-```bash
-uv run python scripts/check_data.py --config config/data/front3d_5431_smoke.yaml
-uv run python scripts/convert_cfr_to_csi.py --config config/data/front3d_5431_smoke.yaml --overwrite
-```
+Because the paper-style config sets `val_split=0` and evaluates test each epoch, `best.pt` is selected by test RMSE. Use `last.pt` when reporting a non-test-selected endpoint.
 
-DeepMIMO smoke:
-
-```bash
-uv run python scripts/check_data.py --config config/data/deepmimo_o1_3p5_smoke.yaml
-uv run python scripts/convert_cfr_to_csi.py --config config/data/deepmimo_o1_3p5_smoke.yaml --overwrite
-```
-
-Paper-style Front3D config:
-
-```bash
-uv run python scripts/convert_cfr_to_csi.py --config config/data/front3d_5431_paper.yaml --overwrite
-uv run python train_mpri.py --config config/train/front3d_5431_paper400.yaml
-```
-
-## Smoke Train And Eval
-
-```bash
-uv run python train_mpri.py --config config/train/smoke.yaml
-uv run python evaluate_mpri.py \
-  --config config/eval/default.yaml \
-  --checkpoint runs/train/<front3d-run>/checkpoints/best.pt
-```
-
-DeepMIMO smoke:
-
-```bash
-uv run python train_mpri.py --config config/train/deepmimo_o1_3p5_smoke.yaml
-uv run python evaluate_mpri.py \
-  --config config/eval/deepmimo_o1_3p5_smoke.yaml \
-  --checkpoint runs/train/<deepmimo-run>/checkpoints/best.pt
-```
-
-Each training run writes `config.yaml`, `train.log`, `metrics.csv`, TensorBoard logs, and `checkpoints/best.pt` / `last.pt` under `runs/train/`.
-
-## Tests
-
-```bash
-uv run python -m pytest -q
-```
+Each conversion run writes under `data/processed/`; each training run writes `config.yaml`, `train.log`, `metrics.csv`, TensorBoard logs, and `checkpoints/best.pt` / `last.pt` under `runs/train/`. These directories are intentionally ignored by git.

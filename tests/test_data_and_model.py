@@ -9,7 +9,7 @@ from scipy.io import savemat
 
 from scripts.convert_cfr_to_csi import build_dataset
 from src.data import CFRDataset, split_indices_by_group
-from src.model import MPRINet
+from src.model import MPRINet, count_parameters
 
 
 def _write_front3d_scene(path: Path) -> None:
@@ -121,3 +121,11 @@ def test_mpri_outputs_2d() -> None:
     model = MPRINet(in_channels=2, output_dim=2)
     y = model(torch.randn(3, 2, 32, 16))
     assert tuple(y.shape) == (3, 2)
+
+
+def test_mpri_paper_scale_matches_reported_parameter_count() -> None:
+    model = MPRINet(in_channels=1, output_dim=3)
+    n_params = count_parameters(model)
+    assert 2_550_000 <= n_params <= 2_700_000
+    y = model(torch.randn(2, 1, 193, 16))
+    assert tuple(y.shape) == (2, 3)

@@ -1,7 +1,7 @@
 [project]
 name = "mpri-baseline"
 version = "0.1.0"
-description = "MPRI baseline reproduction adapted to Front3D and DeepMIMO CFR data."
+description = "MPRI CFR-image localization baseline adapted to Front3D and DeepMIMO data."
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
