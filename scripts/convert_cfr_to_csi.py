@@ -37,7 +37,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "include_clean": False,
         "seed": 2026,
     },
-    "front3d": {"bs_ids": None, "max_bs": None, "bs_count": None, "bs_selection": "first", "bs_seed": 2026},
+    "front3d": {"bs_ids": None, "max_bs": None, "bs_count": None, "bs_selection": "random", "bs_seed": 2026},
     "outputs": {
         "strict_name": "csi_strict_log_abs_193.h5",
         "padded_name": "csi_padded_log_abs_193.h5",

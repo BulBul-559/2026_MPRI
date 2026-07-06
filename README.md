@@ -56,7 +56,7 @@ MPRI consumes converted scene-level MPRI HDF5 files. The converter supports two 
 - Single BS: set `bs_selection: random`, `bs_count: 1`, and `bs_seed`; the converter picks one deterministic random scene representative BS.
 - Multi BS: set `bs_selection: random`, `bs_count: 4`, and `bs_seed`; the converter picks four deterministic random BS for the scene. The padded output takes the union of UE positions observed by the selected BS and fills missing BS feature slots with zero. The strict output keeps only UE samples observed by all selected BS.
 
-Explicit `bs_ids` still overrides random selection. For formal multi-BS baseline runs, use the padded output unless the experiment intentionally requires all four BS to observe every UE.
+`random` is the converter default for Front3D/DeepMIMOFactory CFR inputs. Explicit `bs_ids` still overrides random selection. For formal multi-BS baseline runs, use the padded output unless the experiment intentionally requires all four BS to observe every UE.
 
 ## Metrics And Outputs
 

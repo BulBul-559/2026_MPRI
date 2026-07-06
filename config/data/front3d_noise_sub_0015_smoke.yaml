@@ -17,7 +17,9 @@ augmentation:
   include_clean: false
   seed: 2026
 front3d:
-  max_bs: 2
+  bs_count: 4
+  bs_selection: random
+  bs_seed: 2026
 outputs:
   strict_name: csi_strict_log_abs_64_offline_snr3.h5
   padded_name: csi_padded_log_abs_64_offline_snr3.h5
