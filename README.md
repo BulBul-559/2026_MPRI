@@ -3,7 +3,7 @@
 This project adapts the MPRI CFR-image localization baseline to the current baseline matrix data scope:
 
 - Front3D CFR-only HDF5: `Front3d_2988_CFR_Only`
-- DeepMIMO O1_3p5 path-parameter `.mat`
+- DeepMIMO offline CFR HDF5 produced by `../DeepMIMOFactory`
 
 The active conversion path writes the MPRI input contract:
 
@@ -12,7 +12,9 @@ features: (W, H, C, N)
 labels/position: (N, 2)
 ```
 
-`W` is the flattened CFR/image feature width, `H` is selected subcarriers, `C` is the BS/anchor depth, and `N` is samples. Configs must declare `dataset.format: front3d` or `dataset.format: deepmimo`. Data roots can be overridden with `BASELINE_FRONT3D_ROOT` and `BASELINE_DEEPMIMO_ROOT`.
+`W` is the flattened CFR/image feature width, `H` is selected subcarriers, `C` is the BS/anchor depth, and `N` is samples. Configs must declare `dataset.format: front3d` or `dataset.format: deepmimo`. Data roots can be overridden with `BASELINE_FRONT3D_ROOT` and `BASELINE_DEEPMIMO_CFR_ROOT`.
+
+DeepMIMO production is intentionally outside this repository. MPRI consumes `deepmimo_cfr_v1` HDF5 scenes and then performs its own MPRI conversion plus optional SNR augmentation. It does not read DeepMIMO raw `.mat` files or synthesize CFR from path parameters.
 
 ## Paper Alignment
 
@@ -20,11 +22,11 @@ Confirmed from the paper:
 
 - CFR images are built by flattening MIMO CFR observations.
 - Noise augmentation uses three SNR levels shown/described as `50 dB`, `20 dB`, and `10 dB`.
-- The paper adds noise at the PHY `Filter_multipath` stage; this repo applies AWGN to available CFR or path-derived CFR as an adaptation because the current datasets do not store the original PHY filter.
+- The paper adds noise at the PHY `Filter_multipath` stage; this repo applies AWGN to available offline CFR as an adaptation because the current datasets do not store the original PHY filter.
 - Training uses `400` epochs, initial learning rate `1e-3`, and a `50/0.3` epoch/drop-factor schedule.
 - The paper reports a `0.8` train/test split.
 
-Not fully specified in the paper and still tracked for review: optimizer details, batch size, and the exact DeepMIMO path-parameter-to-CFR synthesis contract.
+Not fully specified in the paper and still tracked for review: optimizer details and batch size.
 
 ## Front3D Noisy Workflow
 
@@ -36,6 +38,14 @@ BASELINE_FRONT3D_ROOT=/path/to/Front3d_2988_CFR_Only \
 ```
 
 By default, the script writes to `$BASELINE_FRONT3D_ROOT/noise_sub_test_set`. Override with `BASELINE_FRONT3D_NOISE_ROOT` or `--output-root`. The generated `manifest.json` is authoritative only after the builder completes all selected scenes; interrupted `.h5.tmp` files are not part of the dataset contract.
+
+DeepMIMO smoke uses the same converter with `dataset.format: deepmimo`; the input must already be offline CFR from `DeepMIMOFactory`:
+
+```bash
+BASELINE_DEEPMIMO_CFR_ROOT=/path/to/deepmimo_cfr_root \
+.venv/bin/python scripts/convert_cfr_to_csi.py \
+  --config config/data/deepmimo_o1_3p5_smoke.yaml --overwrite
+```
 
 ## Single-Scene 400-Epoch Evidence
 

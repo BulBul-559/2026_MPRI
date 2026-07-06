@@ -1,13 +1,13 @@
 dataset:
   format: deepmimo
-  root_env: BASELINE_DEEPMIMO_ROOT
-  root: ../data/DeepMIMO_O1_3p5
-  key: t003_tx000_r000
+  root_env: BASELINE_DEEPMIMO_CFR_ROOT
+  root: ../DeepMIMOFactory/data/processed/o1_3p5_smoke
+  scene_id: deepmimo_o1_3p5_smoke
 output_dir: data/processed/deepmimo_o1_3p5_smoke
 label_dims: 2
 representation: amp_phase
 eps: 1.0e-8
-sample_limit: 96
+sample_limit: 8
 subcarriers:
   policy: uniform
   count: 64
@@ -16,9 +16,9 @@ augmentation:
   snr_db: [50.0, 20.0, 10.0]
   include_clean: false
   seed: 2026
-deepmimo:
-  path_count: 16
-  bandwidth_hz: 100000000.0
+front3d:
+  bs_ids: [3, 4]
+  max_bs: 2
 outputs:
   strict_name: csi_strict_amp_phase_64_snr3.h5
   padded_name: csi_padded_amp_phase_64_snr3.h5

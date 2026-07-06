@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert Front3D or DeepMIMO data into the MPRI CFR-image HDF5 contract."""
+"""Convert offline CFR HDF5 data into the MPRI CFR-image HDF5 contract."""
 
 from __future__ import annotations
 
@@ -37,11 +37,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "seed": 2026,
     },
     "front3d": {"bs_ids": None, "max_bs": None},
-    "deepmimo": {
-        "key": "t003_tx000_r000",
-        "path_count": 16,
-        "bandwidth_hz": 100_000_000.0,
-    },
     "outputs": {
         "strict_name": "csi_strict_log_abs_193.h5",
         "padded_name": "csi_padded_log_abs_193.h5",
@@ -52,7 +47,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert Front3D/DeepMIMO data for MPRI.")
+    parser = argparse.ArgumentParser(description="Convert offline CFR HDF5 data for MPRI.")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing processed files.")
     return parser.parse_args()
@@ -83,10 +78,7 @@ def load_config(path: Path) -> dict[str, Any]:
     if fmt not in {"front3d", "deepmimo"}:
         raise ValueError(f"Unsupported dataset.format: {fmt!r}; expected front3d or deepmimo.")
     dataset["format"] = fmt
-    if fmt == "front3d":
-        dataset.pop("key", None)
-    else:
-        dataset.pop("scene_id", None)
+    dataset.pop("key", None)
     dataset["root"] = str(_resolve_root(dataset))
     cfg["label_dims"] = int(cfg["label_dims"])
     cfg["representation"] = str(cfg["representation"])
@@ -107,8 +99,6 @@ def load_config(path: Path) -> dict[str, Any]:
     aug["snr_db"] = [float(v) for v in aug.get("snr_db", [])]
     if aug["enabled"] and not aug["snr_db"]:
         raise ValueError("augmentation.snr_db must be non-empty when augmentation.enabled is true.")
-    cfg["deepmimo"]["path_count"] = int(cfg["deepmimo"].get("path_count", 16))
-    cfg["deepmimo"]["bandwidth_hz"] = float(cfg["deepmimo"].get("bandwidth_hz", 100_000_000.0))
     return cfg
 
 
@@ -148,18 +138,18 @@ def make_run_dir(cfg: dict[str, Any]) -> Path:
 def input_files(cfg: dict[str, Any]) -> list[Path]:
     dataset = cfg["dataset"]
     root = Path(dataset["root"])
-    if dataset["format"] == "front3d":
+    if dataset["format"] in {"front3d", "deepmimo"}:
         scene_id = dataset.get("scene_id")
         if scene_id:
             path = root / "scenes" / f"{scene_id}.h5"
             if not path.exists():
-                raise FileNotFoundError(f"Front3D scene not found: {path}")
+                raise FileNotFoundError(f"CFR scene not found: {path}")
             return [path]
         if root.is_file():
             return [root]
         files = sorted((root / "scenes").glob("*.h5")) if (root / "scenes").is_dir() else sorted(root.glob("*.h5"))
         if not files:
-            raise FileNotFoundError(f"No Front3D .h5 files found under {root}")
+            raise FileNotFoundError(f"No CFR .h5 files found under {root}")
         return files
     return [root]
 
@@ -220,14 +210,12 @@ def complex_to_feature(x: np.ndarray, indices: np.ndarray, representation: str, 
 
 def build_dataset(files: list[Path], cfg: dict[str, Any], require_all_anchors: bool) -> dict[str, np.ndarray]:
     fmt = cfg["dataset"]["format"]
-    if fmt == "front3d":
-        return build_front3d_dataset(files, cfg, require_all_anchors)
-    if fmt == "deepmimo":
-        return build_deepmimo_dataset(Path(files[0]), cfg, require_all_anchors)
+    if fmt in {"front3d", "deepmimo"}:
+        return build_cfr_dataset(files, cfg, require_all_anchors)
     raise ValueError(f"Unsupported dataset format: {fmt}")
 
 
-def build_front3d_dataset(files: list[Path], cfg: dict[str, Any], require_all_anchors: bool) -> dict[str, np.ndarray]:
+def build_cfr_dataset(files: list[Path], cfg: dict[str, Any], require_all_anchors: bool) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(int(cfg["augmentation"]["seed"]))
     levels = augmentation_levels(cfg)
     features_parts: list[np.ndarray] = []
@@ -245,7 +233,7 @@ def build_front3d_dataset(files: list[Path], cfg: dict[str, Any], require_all_an
     for shard_i, path in enumerate(files):
         with h5py.File(path, "r") as f:
             if "cfr" not in f or "target_xy" not in f:
-                raise ValueError(f"{path} is not a Front3D CFR-only scene file.")
+                raise ValueError(f"{path} is not an offline CFR scene file.")
             cfr = np.asarray(f["cfr"])
             labels = np.asarray(f["target_xy"], dtype=np.float32)
             ue_ids = np.asarray(f["ue_id"] if "ue_id" in f else np.arange(cfr.shape[0]), dtype=np.int64)
@@ -256,8 +244,8 @@ def build_front3d_dataset(files: list[Path], cfg: dict[str, Any], require_all_an
             if subcarrier_indices is None:
                 subcarrier_indices = choose_subcarriers(cfr.shape[-1], cfg["subcarriers"]["policy"], cfg["subcarriers"]["count"])
             if selected_bs is None:
-                selected_bs = select_front3d_bs(bs_ids, cfg)
-            rows: list[tuple[int, dict[int, int], np.ndarray, float | None]] = front3d_sample_rows(
+                selected_bs = select_cfr_bs(bs_ids, cfg)
+            rows: list[tuple[int, dict[int, int], np.ndarray, float | None]] = cfr_sample_rows(
                 labels,
                 ue_ids,
                 bs_ids,
@@ -315,7 +303,7 @@ def build_front3d_dataset(files: list[Path], cfg: dict[str, Any], require_all_an
             snr_parts.append(sample_snr)
 
     if not features_parts or subcarrier_indices is None or selected_bs is None:
-        raise ValueError("No Front3D samples were converted.")
+        raise ValueError("No CFR samples were converted.")
     return pack_output(
         cfg,
         features_parts,
@@ -340,7 +328,7 @@ def build_front3d_dataset(files: list[Path], cfg: dict[str, Any], require_all_an
     )
 
 
-def front3d_sample_rows(
+def cfr_sample_rows(
     labels: np.ndarray,
     ue_ids: np.ndarray,
     bs_ids: np.ndarray,
@@ -361,7 +349,7 @@ def front3d_sample_rows(
         for ue in ordered_ues:
             present = {int(bs): link_map[(ue, int(bs))] for bs in selected_bs.tolist() if (ue, int(bs)) in link_map}
             present = {bs: idx for bs, idx in present.items() if bool(valid[idx])}
-            append_front3d_row(
+            append_cfr_row(
                 rows,
                 ue,
                 present,
@@ -391,7 +379,7 @@ def front3d_sample_rows(
         row_snr = None
         if source_snr is not None and present:
             row_snr = float(source_snr[next(iter(present.values()))])
-        append_front3d_row(
+        append_cfr_row(
             rows,
             ue,
             present,
@@ -404,7 +392,7 @@ def front3d_sample_rows(
     return rows
 
 
-def append_front3d_row(
+def append_cfr_row(
     rows: list[tuple[int, dict[int, int], np.ndarray, float | None]],
     ue: int,
     present: dict[int, int],
@@ -423,7 +411,7 @@ def append_front3d_row(
     rows.append((ue, present, labels[first_idx, :label_dims], source_snr))
 
 
-def select_front3d_bs(bs_ids: np.ndarray, cfg: dict[str, Any]) -> np.ndarray:
+def select_cfr_bs(bs_ids: np.ndarray, cfg: dict[str, Any]) -> np.ndarray:
     requested = cfg.get("front3d", {}).get("bs_ids")
     if requested:
         values = np.asarray([int(v) for v in requested], dtype=np.int64)
@@ -433,110 +421,8 @@ def select_front3d_bs(bs_ids: np.ndarray, cfg: dict[str, Any]) -> np.ndarray:
     if max_bs is not None:
         values = values[: int(max_bs)]
     if values.size == 0:
-        raise ValueError("No Front3D BS ids selected.")
+        raise ValueError("No BS ids selected.")
     return values
-
-
-def build_deepmimo_dataset(root: Path, cfg: dict[str, Any], require_all_anchors: bool) -> dict[str, np.ndarray]:
-    del require_all_anchors
-    key = str(cfg["dataset"].get("key") or cfg.get("deepmimo", {}).get("key") or "t003_tx000_r000")
-    rx_pos = deepmimo_array(root, key, "rx_pos").astype(np.float32)
-    tx_pos = deepmimo_array(root, key, "tx_pos").astype(np.float32)
-    power_db = deepmimo_array(root, key, "power").astype(np.float32)
-    phase_deg = deepmimo_array(root, key, "phase").astype(np.float32)
-    delay_s = deepmimo_array(root, key, "delay").astype(np.float32)
-    n = int(rx_pos.shape[0])
-    if cfg["sample_limit"] is not None:
-        n = min(n, int(cfg["sample_limit"]))
-    path_count = int(cfg["deepmimo"]["path_count"])
-    subcarrier_indices = np.arange(int(cfg["subcarriers"]["count"]), dtype=np.int64)
-    freqs = np.linspace(
-        -0.5 * float(cfg["deepmimo"]["bandwidth_hz"]),
-        0.5 * float(cfg["deepmimo"]["bandwidth_hz"]),
-        subcarrier_indices.size,
-        dtype=np.float32,
-    )
-    rng = np.random.default_rng(int(cfg["augmentation"]["seed"]))
-    levels = augmentation_levels(cfg)
-    sample0 = deepmimo_virtual_cfr(power_db[0], phase_deg[0], delay_s[0], freqs, path_count)
-    sample0_feature = complex_to_feature(sample0, subcarrier_indices, cfg["representation"], cfg["eps"])
-    out_n = n * len(levels)
-    sample_features = np.zeros((sample0_feature.shape[0], subcarrier_indices.size, 1, out_n), dtype=np.float32)
-    sample_labels = np.zeros((out_n, cfg["label_dims"]), dtype=np.float32)
-    sample_labels3d = np.zeros((out_n, 3), dtype=np.float32)
-    sample_valid = np.ones((out_n, 1), dtype=np.uint8)
-    sample_global = np.zeros(out_n, dtype=np.int64)
-    sample_local = np.zeros(out_n, dtype=np.int64)
-    sample_snr = np.full(out_n, np.nan, dtype=np.float32)
-    out_i = 0
-    for i in range(n):
-        base = deepmimo_virtual_cfr(power_db[i], phase_deg[i], delay_s[i], freqs, path_count)
-        for snr_db in levels:
-            noisy = add_awgn(base, snr_db, rng)
-            sample_features[:, :, 0, out_i] = complex_to_feature(noisy, subcarrier_indices, cfg["representation"], cfg["eps"])
-            sample_labels[out_i] = rx_pos[i, : cfg["label_dims"]]
-            sample_labels3d[out_i] = rx_pos[i, :3]
-            sample_global[out_i] = i
-            sample_local[out_i] = i
-            if snr_db is not None:
-                sample_snr[out_i] = float(snr_db)
-            out_i += 1
-    return pack_output(
-        cfg,
-        [sample_features],
-        [sample_labels],
-        [sample_labels3d],
-        [sample_global],
-        [sample_local],
-        [np.zeros(out_n, dtype=np.int64)],
-        [sample_valid],
-        [np.asarray([f"deepmimo:{key}"] * out_n, dtype=object)],
-        [sample_snr],
-        anchor_ids=np.asarray([0], dtype=np.int64),
-        anchor_positions=tx_pos[:, :3].astype(np.float32),
-        subcarrier_indices=subcarrier_indices,
-        layout={
-            "localized_side": "rx",
-            "anchor_side": "tx",
-            "tx_role": "bs",
-            "rx_role": "ue",
-            "phy_link_direction": "downlink",
-        },
-    )
-
-
-def deepmimo_array(root: Path, key: str, field: str) -> np.ndarray:
-    try:
-        from scipy.io import loadmat
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("DeepMIMO conversion requires scipy; run `uv sync --extra dev`.") from exc
-    path = root / f"{field}_{key}.mat"
-    if not path.exists():
-        raise FileNotFoundError(f"Missing DeepMIMO file: {path}")
-    data = loadmat(path, variable_names=[field])
-    if field not in data:
-        raise KeyError(f"Field {field!r} not found in {path}")
-    return np.asarray(data[field])
-
-
-def deepmimo_virtual_cfr(
-    power_db: np.ndarray,
-    phase_deg: np.ndarray,
-    delay_s: np.ndarray,
-    freqs: np.ndarray,
-    path_count: int,
-) -> np.ndarray:
-    valid = np.isfinite(power_db) & np.isfinite(phase_deg) & np.isfinite(delay_s)
-    order = np.argsort(np.where(valid, power_db, -np.inf))[::-1][:path_count]
-    out = np.zeros((path_count, freqs.size), dtype=np.complex64)
-    for out_i, path_i in enumerate(order.tolist()):
-        if not valid[path_i]:
-            continue
-        amp = np.sqrt(10.0 ** (float(power_db[path_i]) / 10.0))
-        phase0 = np.deg2rad(float(phase_deg[path_i]))
-        phase = phase0 - 2.0 * np.pi * freqs.astype(np.float64) * float(delay_s[path_i])
-        out[out_i] = (amp * np.exp(1j * phase)).astype(np.complex64)
-    return out
 
 
 def pack_output(
@@ -621,7 +507,7 @@ def save_output(path: Path, data: dict[str, np.ndarray], cfg: dict[str, Any], mo
             "feature_width": int(data["features"].shape[0]),
             "augmentation_enabled": bool(cfg["augmentation"]["enabled"]),
             "augmentation_snr_db": json.dumps(cfg["augmentation"]["snr_db"]),
-            "augmentation_note": "AWGN is applied to CFR/path-derived CFR as an adaptation of paper PHY-layer Filter_multipath noise.",
+            "augmentation_note": "AWGN is applied to offline CFR as an adaptation of paper PHY-layer Filter_multipath noise.",
             "localized_side": layout["localized_side"],
             "anchor_side": layout["anchor_side"],
             "tx_role": layout["tx_role"],
@@ -638,7 +524,7 @@ def write_metadata_json(path: Path, data: dict[str, np.ndarray], cfg: dict[str, 
         "mode": mode,
         "dataset_format": cfg["dataset"]["format"],
         "dataset_root": cfg["dataset"]["root"],
-        "dataset_scene_or_key": cfg["dataset"].get("scene_id") or cfg["dataset"].get("key") or cfg["deepmimo"].get("key"),
+        "dataset_scene": cfg["dataset"].get("scene_id"),
         "representation": cfg["representation"],
         "label_dims": cfg["label_dims"],
         "feature_shape_whcn": [int(v) for v in data["features"].shape],

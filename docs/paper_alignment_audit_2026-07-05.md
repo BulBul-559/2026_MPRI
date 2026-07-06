@@ -17,10 +17,10 @@ Evidence reviewed:
 | Network scale | Aligned at parameter-count level: `MPRINet(in_channels=1, output_dim=3)` has `2,622,019` trainable parameters, matching the paper's approximately 2.6M claim. |
 | MPRI module | Aligned in structure: input module, upper half, lower half, residual/cross connections, and output head are implemented. The code wraps the two paper paths inside one `DualPathBasicUnit` per stacked layer. |
 | Training schedule | Aligned for paper-style config: 400 epochs, learning rate `1e-3`, StepLR `50/0.3`, and per-epoch test evaluation are configured. |
-| Noise augmentation | Partially aligned: SNR levels and augmentation multiplicity match the paper, but current data lacks PHY `Filter_multipath`, so AWGN is applied to available CFR or path-derived CFR. |
+| Noise augmentation | Partially aligned: SNR levels and augmentation multiplicity match the paper, but current data lacks PHY `Filter_multipath`, so AWGN is applied to offline CFR. |
 | Dataset/split | Adapted: the paper uses its two generated scenarios and 3D labels; current Front3D uses project-level UE split and 2D `(x, y)` labels. |
 | Optimizer/batch | Paper text inspected here did not specify them. Current paper-style config uses Adam, batch size 32, weight decay 0.0; this remains a documented implementation choice. |
-| DeepMIMO | Adapted: DeepMIMO `.mat` path parameters are synthesized into virtual CFR before MPRI conversion and remain under the shared DeepMIMO contract review. |
+| DeepMIMO | Adapted through shared offline CFR: DeepMIMO v3/v4 production is owned by `DeepMIMOFactory`; MPRI only reads the produced `deepmimo_cfr_v1` HDF5 and applies the same conversion/noise path as Front3D. |
 
 ## Paper-To-Code Mapping
 
@@ -30,7 +30,7 @@ Evidence reviewed:
 | Frequency down-sampling to `Ns=193` in Fig. 3 | `config/data/front3d_5431_paper.yaml` uses `subcarriers.count: 193`; converter uses uniform subcarrier selection. | Aligned. |
 | MIMO CFR flattening | `complex_to_feature()` flattens non-subcarrier CFR axes before writing the CFR image. Front3D stacks links by UE and selected BS. | Aligned at input contract level; exact physical antenna meaning depends on dataset. |
 | Noise augmentation at SNR 50/20/10 dB, multiplying samples by `s` | Formal config uses `augmentation.enabled: true`, `snr_db: [50,20,10]`, `include_clean: false`; tests assert the three SNR levels. | SNR/multiplicity aligned; insertion point adapted. |
-| Noise insertion before channel-estimation output | Paper adds noise at PHY `Filter_multipath`. Current converter applies complex AWGN to CFR or DeepMIMO virtual CFR because raw `Filter_multipath` is unavailable. | Adaptation; must be described in final reports. |
+| Noise insertion before channel-estimation output | Paper adds noise at PHY `Filter_multipath`. Current converter applies complex AWGN to offline CFR because raw `Filter_multipath` is unavailable. | Adaptation; must be described in final reports. |
 | Input module: image input plus Conv-BN-ReLU-Pooling | `InputModule` implements Conv2d -> BatchNorm2d -> ReLU -> MaxPool2d. | Aligned; pool kernel is an implementation choice because the paper does not specify dimensions. |
 | Upper half: bottleneck, four paths, depth concatenation, identity mapping | `UpperHalf` uses 1x1 bottleneck; paths output 64, 32, 32, 128 channels; path 2 uses 5x1 + 1x3; path 3 uses max-pool + 3x3; identity add after concat. | Aligned. |
 | Lower half: two parallel propagation paths, first path 3x3 filters, second path 1x1 filters, cross-connections, stacked three times | `LowerHalf` has three `DualPathBasicUnit` stages. Each unit contains both paper paths and exchanges both branch outputs through addition. Stage 2/3 include MaxPool down-sampling. | Aligned in module semantics. |
@@ -59,7 +59,7 @@ Evidence reviewed:
 |---|---|
 | Run Front3D collection-level 400-epoch MPRI experiments and report scene/collection metrics | `FEAT-MPRI-001`; single-scene offline-noise evidence exists, collection-level formal test remains. |
 | Decide whether to add strongest-RSS single-BS contrast in addition to central-BS default | User review under MPRI row in central checklist |
-| Approve or revise DeepMIMO path-parameter to virtual-CFR conversion | `STR-DATA-004` |
+| Keep DeepMIMOFactory output contract stable for MPRI consumption | `STR-DATA-004` |
 | Accept Adam/batch-size/log-abs/2D-output choices as paper adaptations for current Front3D | User review under MPRI row in central checklist |
 
 ## Smoke Evidence
@@ -67,7 +67,9 @@ Evidence reviewed:
 | Data | Run | Test mean / median / P95 |
 |---|---|---|
 | Front3D `front3d_5431` | `runs/eval/mpri_front3d_5431_smoke_eval-2026-07-05-16-03-48` | `2.925 / 2.728 / 3.261 m` |
-| DeepMIMO O1_3p5 | `runs/eval/mpri_deepmimo_o1_3p5_smoke_eval-2026-07-05-16-03-48` | `363.769 / 363.417 / 368.848 m` |
+| DeepMIMO O1_3p5 legacy path-derived smoke | `runs/eval/mpri_deepmimo_o1_3p5_smoke_eval-2026-07-05-16-03-48` | `363.769 / 363.417 / 368.848 m` |
+
+Current DeepMIMO input path has since been updated to consume offline CFR HDF5 from `DeepMIMOFactory`; the legacy path-derived smoke row is historical evidence only.
 
 ## Offline-Noisy Single-Scene Evidence
 

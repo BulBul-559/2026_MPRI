@@ -5,7 +5,6 @@ from pathlib import Path
 import h5py
 import numpy as np
 import torch
-from scipy.io import savemat
 
 from scripts.convert_cfr_to_csi import build_dataset
 from src.data import CFRDataset, split_indices_by_group
@@ -60,40 +59,22 @@ def test_front3d_converter_groups_links_by_ue(tmp_path: Path) -> None:
     assert sorted(set(data["snr_db"].astype(float).tolist())) == [10.0, 20.0, 50.0]
 
 
-def _write_deepmimo(root: Path, key: str = "t001_tx000_r000") -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    n, paths = 10, 6
-    rx_pos = np.stack([np.arange(n), np.arange(n) + 100.0, np.full(n, 2.0)], axis=1).astype(np.float32)
-    tx_pos = np.asarray([[0.0, 0.0, 6.0]], dtype=np.float32)
-    power = -60.0 - np.arange(n * paths, dtype=np.float32).reshape(n, paths) * 0.1
-    phase = np.linspace(-180.0, 180.0, n * paths, dtype=np.float32).reshape(n, paths)
-    delay = np.full((n, paths), 1.0e-7, dtype=np.float32)
-    for field, value in {
-        "rx_pos": rx_pos,
-        "tx_pos": tx_pos,
-        "power": power,
-        "phase": phase,
-        "delay": delay,
-    }.items():
-        savemat(root / f"{field}_{key}.mat", {field: value})
-
-
-def test_deepmimo_converter_synthesizes_virtual_cfr(tmp_path: Path) -> None:
-    key = "t001_tx000_r000"
-    _write_deepmimo(tmp_path, key)
+def test_deepmimo_converter_consumes_offline_cfr(tmp_path: Path) -> None:
+    scene = tmp_path / "deepmimo_cfr_unit.h5"
+    _write_front3d_scene(scene)
     cfg = {
-        "dataset": {"format": "deepmimo", "root": str(tmp_path), "key": key},
+        "dataset": {"format": "deepmimo", "root": str(tmp_path), "scene_id": "deepmimo_cfr_unit"},
         "label_dims": 2,
         "representation": "amp_phase",
         "eps": 1.0e-8,
         "sample_limit": 5,
         "subcarriers": {"policy": "uniform", "count": 16},
         "augmentation": {"enabled": True, "snr_db": [50.0], "include_clean": True, "seed": 11},
-        "deepmimo": {"path_count": 4, "bandwidth_hz": 100_000_000.0},
+        "front3d": {"max_bs": 2},
     }
-    data = build_dataset([tmp_path], cfg, require_all_anchors=False)
-    assert data["features"].shape == (8, 16, 1, 10)
-    np.testing.assert_allclose(data["labels"][0], [0.0, 100.0])
+    data = build_dataset([scene], cfg, require_all_anchors=True)
+    assert data["features"].shape == (16, 16, 2, 10)
+    np.testing.assert_allclose(data["labels"][0], [0.0, 10.0])
     assert data["global_mobile_id"].tolist()[:2] == [0, 0]
 
 
