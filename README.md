@@ -67,3 +67,5 @@ Each conversion run writes under `data/processed/`; each training run writes `co
 Unified evaluation metrics are `mean_error_m`, `mse_m2`, `median_error_m`, `rmse_m`, `cdf_1m`, `cdf_2m`, `p90_error_m`, `p95_error_m`, `p99_error_m`, and `valid_sample_count`. `evaluate_mpri.py` writes this schema to `metrics.csv`; `train_mpri.py` keeps the old epoch columns such as `train_rmse` and `train_mean_err` and also adds the prefixed unified columns for train/val/test.
 
 `predictions.csv` preserves per-sample results. Single-BS converted data is reported as `sample_kind=ue_bs_pair`; multi-BS converted data is reported as `sample_kind=ue_bs_set`. The table includes `bs_set_ids`, `valid_bs_ids`, `valid_bs_count`, and `source_link_ids`; missing selected BS slots are visible through `valid_bs_ids` and `source_link_ids`.
+
+Collection-level reporting uses the same two BaselineAnalysis aggregation routes: average scene-level `metrics.csv` rows for scene-mean metrics, and concatenate all scene `predictions.csv.error_m` rows to recompute pooled metrics/CDF.
