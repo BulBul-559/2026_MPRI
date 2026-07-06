@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -36,7 +37,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "include_clean": False,
         "seed": 2026,
     },
-    "front3d": {"bs_ids": None, "max_bs": None},
+    "front3d": {"bs_ids": None, "max_bs": None, "bs_count": None, "bs_selection": "first", "bs_seed": 2026},
     "outputs": {
         "strict_name": "csi_strict_log_abs_193.h5",
         "padded_name": "csi_padded_log_abs_193.h5",
@@ -271,6 +272,7 @@ def build_cfr_dataset(files: list[Path], cfg: dict[str, Any], require_all_anchor
     local_mobile_parts: list[np.ndarray] = []
     shard_parts: list[np.ndarray] = []
     valid_parts: list[np.ndarray] = []
+    source_link_parts: list[np.ndarray] = []
     source_file_parts: list[np.ndarray] = []
     snr_parts: list[np.ndarray] = []
     subcarrier_indices: np.ndarray | None = None
@@ -314,6 +316,7 @@ def build_cfr_dataset(files: list[Path], cfg: dict[str, Any], require_all_anchor
             sample_labels = np.zeros((out_n, cfg["label_dims"]), dtype=np.float32)
             sample_labels3d = np.zeros((out_n, 3), dtype=np.float32)
             sample_valid = np.zeros((out_n, selected_bs.size), dtype=np.uint8)
+            sample_source_links = np.full((out_n, selected_bs.size), -1, dtype=np.int64)
             sample_global = np.zeros(out_n, dtype=np.int64)
             sample_local = np.zeros(out_n, dtype=np.int64)
             sample_snr = np.full(out_n, np.nan, dtype=np.float32)
@@ -329,6 +332,7 @@ def build_cfr_dataset(files: list[Path], cfg: dict[str, Any], require_all_anchor
                             noisy, subcarrier_indices, cfg["representation"], cfg["eps"]
                         )
                         sample_valid[out_i, anchor_i] = 1
+                        sample_source_links[out_i, anchor_i] = int(idx)
                     sample_labels[out_i] = label
                     sample_labels3d[out_i, : cfg["label_dims"]] = label
                     sample_global[out_i] = int(ue)
@@ -346,6 +350,7 @@ def build_cfr_dataset(files: list[Path], cfg: dict[str, Any], require_all_anchor
             local_mobile_parts.append(sample_local)
             shard_parts.append(np.full(out_n, shard_i, dtype=np.int64))
             valid_parts.append(sample_valid)
+            source_link_parts.append(sample_source_links)
             source_file_parts.append(np.asarray([path.name] * out_n, dtype=object))
             snr_parts.append(sample_snr)
 
@@ -360,6 +365,7 @@ def build_cfr_dataset(files: list[Path], cfg: dict[str, Any], require_all_anchor
         local_mobile_parts,
         shard_parts,
         valid_parts,
+        source_link_parts,
         source_file_parts,
         snr_parts,
         anchor_ids=selected_bs,
@@ -459,17 +465,35 @@ def append_cfr_row(
 
 
 def select_cfr_bs(bs_ids: np.ndarray, cfg: dict[str, Any]) -> np.ndarray:
-    requested = cfg.get("front3d", {}).get("bs_ids")
+    front_cfg = cfg.get("front3d", {})
+    requested = front_cfg.get("bs_ids")
     if requested:
         values = np.asarray([int(v) for v in requested], dtype=np.int64)
     else:
         values = np.unique(bs_ids.astype(np.int64))
-    max_bs = cfg.get("front3d", {}).get("max_bs")
-    if max_bs is not None:
-        values = values[: int(max_bs)]
+    bs_count = front_cfg.get("bs_count", front_cfg.get("max_bs"))
+    if bs_count is not None and values.size > int(bs_count):
+        values = _select_bs_subset(values, int(bs_count), cfg)
     if values.size == 0:
         raise ValueError("No BS ids selected.")
-    return values
+    return np.asarray(values, dtype=np.int64)
+
+
+def _select_bs_subset(values: np.ndarray, count: int, cfg: dict[str, Any]) -> np.ndarray:
+    if count <= 0:
+        raise ValueError("front3d.bs_count/max_bs must be positive.")
+    front_cfg = cfg.get("front3d", {})
+    selection = str(front_cfg.get("bs_selection", "first")).strip().lower()
+    if selection in {"first", "sorted", "head"}:
+        return np.asarray(values[:count], dtype=np.int64)
+    if selection in {"random", "deterministic_random"}:
+        seed = int(front_cfg.get("bs_seed", cfg.get("augmentation", {}).get("seed", 2026)))
+        scene_hint = str(cfg.get("dataset", {}).get("scene_id", ""))
+        digest = hashlib.sha256(scene_hint.encode("utf-8")).digest()
+        scene_offset = int.from_bytes(digest[:4], "little")
+        rng = np.random.default_rng(seed + scene_offset)
+        return np.sort(rng.choice(values, size=count, replace=False)).astype(np.int64)
+    raise ValueError(f"Unsupported front3d.bs_selection: {selection!r}")
 
 
 def pack_output(
@@ -481,6 +505,7 @@ def pack_output(
     local_mobile_parts: list[np.ndarray],
     shard_parts: list[np.ndarray],
     valid_parts: list[np.ndarray],
+    source_link_parts: list[np.ndarray],
     source_file_parts: list[np.ndarray],
     snr_parts: list[np.ndarray],
     *,
@@ -501,6 +526,7 @@ def pack_output(
         "local_tx_id": local_mobile,
         "shard_index": np.concatenate(shard_parts, axis=0),
         "valid_anchor_mask": np.concatenate(valid_parts, axis=0),
+        "source_link_ids": np.concatenate(source_link_parts, axis=0),
         "source_file": np.concatenate(source_file_parts, axis=0),
         "snr_db": np.concatenate(snr_parts, axis=0),
         "anchor_positions_m": anchor_positions.astype(np.float32),
@@ -533,6 +559,7 @@ def save_output(path: Path, data: dict[str, np.ndarray], cfg: dict[str, Any], mo
             "local_mobile_id",
             "shard_index",
             "valid_anchor_mask",
+            "source_link_ids",
             "anchor_positions_m",
             "global_anchor_ids",
             "subcarrier_indices",

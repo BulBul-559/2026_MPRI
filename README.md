@@ -49,15 +49,21 @@ BASELINE_DEEPMIMO_CFR_ROOT=/path/to/deepmimo_cfr_root \
 
 The current DeepMIMO smoke source is the axis-corrected Factory export with `cfr.shape == (16, 16, 2, 768)`. The MPRI smoke config selects 64 subcarriers and writes 24 samples from 8 UE x 3 SNR levels.
 
-## Single-Scene 400-Epoch Evidence
+## BS Convention
 
-The current local paper-style smoke/formal check uses one prepared noisy scene, `front3d_0015`, with `400` epochs and the paper-style LR schedule. These `runs/` artifacts are local and are not committed.
+MPRI consumes converted scene-level MPRI HDF5 files. The converter supports two formal BS modes through `front3d` config:
 
-| Input | Best checkpoint test mean / median / P95 / RMSE | Last checkpoint test mean / median / P95 / RMSE | Training time |
-|---|---|---|---|
-| 193 subcarriers | `0.572 / 0.480 / 1.279 / 0.690 m` at epoch 25 | `0.577 / 0.425 / 1.573 / 0.817 m` at epoch 400 | `6:47.28` |
-| Raw 768 subcarriers | `0.558 / 0.458 / 1.333 / 0.687 m` at epoch 26 | `0.603 / 0.449 / 1.522 / 0.812 m` at epoch 400 | `21:52.69` |
+- Single BS: set `bs_selection: random`, `bs_count: 1`, and `bs_seed`; the converter picks one deterministic random scene representative BS.
+- Multi BS: set `bs_selection: random`, `bs_count: 4`, and `bs_seed`; the converter picks four deterministic random BS for the scene. The padded output takes the union of UE positions observed by the selected BS and fills missing BS feature slots with zero. The strict output keeps only UE samples observed by all selected BS.
 
-Because the paper-style config sets `val_split=0` and evaluates test each epoch, `best.pt` is selected by test RMSE. Use `last.pt` when reporting a non-test-selected endpoint.
+Explicit `bs_ids` still overrides random selection. For formal multi-BS baseline runs, use the padded output unless the experiment intentionally requires all four BS to observe every UE.
 
-Each conversion run writes under `data/processed/`; each training run writes `config.yaml`, `train.log`, `metrics.csv`, TensorBoard logs, and `checkpoints/best.pt` / `last.pt` under `runs/train/`. These directories are intentionally ignored by git.
+## Metrics And Outputs
+
+Previous local MPRI test results are treated as obsolete after the metric/BS convention update and should be regenerated before reporting.
+
+Each conversion run writes under `data/processed/`; each training run writes `config.yaml`, `train.log`, `metrics.csv`, TensorBoard logs, and `checkpoints/best.pt` / `last.pt` under `runs/train/`. These directories are intentionally ignored by git. Because the paper-style config sets `val_split=0` and evaluates test each epoch, `best.pt` is selected by test RMSE. Use `last.pt` when reporting a non-test-selected endpoint.
+
+Unified evaluation metrics are `mean_error_m`, `mse_m2`, `median_error_m`, `rmse_m`, `cdf_1m`, `cdf_2m`, `p90_error_m`, `p95_error_m`, `p99_error_m`, and `valid_sample_count`. `evaluate_mpri.py` writes this schema to `metrics.csv`; `train_mpri.py` keeps the old epoch columns such as `train_rmse` and `train_mean_err` and also adds the prefixed unified columns for train/val/test.
+
+`predictions.csv` preserves per-sample results. Single-BS converted data is reported as `sample_kind=ue_bs_pair`; multi-BS converted data is reported as `sample_kind=ue_bs_set`. The table includes `bs_set_ids`, `valid_bs_ids`, `valid_bs_count`, and `source_link_ids`; missing selected BS slots are visible through `valid_bs_ids` and `source_link_ids`.

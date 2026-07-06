@@ -15,6 +15,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Subset
 
 from src.data import CFRDataset, NormalizeTransform
+from src.metrics import METRIC_COLUMNS, localization_metrics
 from src.model import MPRINet
 
 
@@ -123,15 +124,10 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device) -
     truth = torch.cat(targets, dim=0)
     diff = prediction - truth
     err = torch.linalg.norm(diff, dim=-1)
+    err_np = err.numpy()
     metrics = {
         "loss_mse": float(np.mean(losses)) if losses else 0.0,
-        "mean_error_m": float(err.mean()),
-        "median_error_m": float(err.median()),
-        "rmse_m": float(torch.sqrt(torch.mean(torch.sum(diff**2, dim=-1)))),
-        "p80_error_m": float(torch.quantile(err, 0.80)),
-        "p90_error_m": float(torch.quantile(err, 0.90)),
-        "p95_error_m": float(torch.quantile(err, 0.95)),
-        "valid_sample_count": int(err.numel()),
+        **localization_metrics(err_np),
         "axis_mae": torch.mean(torch.abs(diff), dim=0).numpy().tolist(),
     }
     return {
@@ -156,8 +152,9 @@ def split_indices(checkpoint: dict[str, Any], split: str, n: int) -> list[int]:
 
 def write_metrics(path: Path, split: str, metrics: dict[str, Any]) -> None:
     row = {"split": split, **{k: v for k, v in metrics.items() if k != "axis_mae"}}
+    fieldnames = ["split", "loss_mse", *METRIC_COLUMNS, *[key for key in row if key not in {"split", "loss_mse", *METRIC_COLUMNS}]]
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerow(row)
 
@@ -174,12 +171,23 @@ def write_predictions(path: Path, dataset: CFRDataset, indices: list[int], resul
         local_mobile = dataset.metadata_array("local_tx_id")
     shard = dataset.metadata_array("shard_index")
     source_file = dataset.metadata_array("source_file")
+    anchor_ids = dataset.metadata_array("global_anchor_ids")
+    valid_anchor_mask = dataset.metadata_array("valid_anchor_mask")
+    source_link_ids = dataset.metadata_array("source_link_ids")
     attrs = dataset.attrs()
     fieldnames = [
+        "sample_kind",
+        "sample_key",
         "sample_index",
+        "global_link_id",
+        "source_link_ids",
         "global_mobile_id",
         "shard_index",
         "local_mobile_id",
+        "bs_id",
+        "bs_set_ids",
+        "valid_bs_ids",
+        "valid_bs_count",
         "localized_side",
         "anchor_side",
         "source_file",
@@ -192,11 +200,23 @@ def write_predictions(path: Path, dataset: CFRDataset, indices: list[int], resul
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for out_i, sample_index in enumerate(indices):
+            valid_bs_ids = _valid_bs_ids(anchor_ids, valid_anchor_mask, sample_index)
+            bs_set_ids = _anchor_ids(anchor_ids)
+            sample_kind = "ue_bs_pair" if len(bs_set_ids) == 1 else "ue_bs_set"
+            source_ids = _source_link_ids(source_link_ids, sample_index)
             row = {
+                "sample_kind": sample_kind,
+                "sample_key": _sample_key(global_mobile, sample_index, bs_set_ids, valid_bs_ids),
                 "sample_index": sample_index,
+                "global_link_id": int(source_ids[0]) if source_ids else -1,
+                "source_link_ids": json.dumps(source_ids),
                 "global_mobile_id": int(global_mobile[sample_index]) if global_mobile is not None else sample_index,
                 "shard_index": int(shard[sample_index]) if shard is not None else "",
                 "local_mobile_id": int(local_mobile[sample_index]) if local_mobile is not None else "",
+                "bs_id": int(valid_bs_ids[0]) if sample_kind == "ue_bs_pair" and valid_bs_ids else -1,
+                "bs_set_ids": json.dumps(bs_set_ids),
+                "valid_bs_ids": json.dumps(valid_bs_ids),
+                "valid_bs_count": len(valid_bs_ids),
                 "localized_side": str(attrs.get("localized_side", "")),
                 "anchor_side": str(attrs.get("anchor_side", "")),
                 "source_file": _decode(source_file[sample_index]) if source_file is not None else "",
@@ -206,6 +226,37 @@ def write_predictions(path: Path, dataset: CFRDataset, indices: list[int], resul
                 row[f"true_{name}"] = float(gt[out_i, dim])
                 row[f"pred_{name}"] = float(pred[out_i, dim])
             writer.writerow(row)
+
+
+def _anchor_ids(anchor_ids: np.ndarray | None) -> list[int]:
+    if anchor_ids is None:
+        return []
+    return [int(v) for v in np.asarray(anchor_ids).reshape(-1).tolist()]
+
+
+def _valid_bs_ids(anchor_ids: np.ndarray | None, valid_anchor_mask: np.ndarray | None, sample_index: int) -> list[int]:
+    all_anchor_ids = _anchor_ids(anchor_ids)
+    if not all_anchor_ids:
+        return []
+    if valid_anchor_mask is None:
+        return all_anchor_ids
+    mask = np.asarray(valid_anchor_mask[sample_index]).astype(bool).reshape(-1)
+    return [bs for bs, is_valid in zip(all_anchor_ids, mask.tolist(), strict=False) if is_valid]
+
+
+def _source_link_ids(source_link_ids: np.ndarray | None, sample_index: int) -> list[int]:
+    if source_link_ids is None:
+        return []
+    values = np.asarray(source_link_ids[sample_index]).reshape(-1)
+    return [int(v) for v in values.tolist() if int(v) >= 0]
+
+
+def _sample_key(global_mobile: np.ndarray | None, sample_index: int, bs_set_ids: list[int], valid_bs_ids: list[int]) -> str:
+    ue_id = int(global_mobile[sample_index]) if global_mobile is not None else int(sample_index)
+    if len(bs_set_ids) == 1:
+        bs = valid_bs_ids[0] if valid_bs_ids else bs_set_ids[0]
+        return f"ue={ue_id}:bs={bs}"
+    return f"ue={ue_id}:bs_set={','.join(str(v) for v in bs_set_ids)}"
 
 
 def _decode(value: Any) -> str:

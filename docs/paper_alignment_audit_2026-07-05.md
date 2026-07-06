@@ -49,34 +49,31 @@ Evidence reviewed:
 | Periodic learning-rate drop `50/0.3` | Paper-style config uses `StepLR(step_size=50, gamma=0.3)`. | Aligned. |
 | Test set evaluated each epoch | Paper-style config sets `evaluate_test_each_epoch: true`. With `val_split=0`, `train_mpri.py` selects the best checkpoint by test RMSE. | Aligned with paper experimental protocol. |
 | 0.8 train/test split | Paper-style config uses train/val/test `0.80/0.00/0.20`; `ue_level` grouping avoids duplicated augmented samples crossing split boundaries. | Aligned with leakage-safe adaptation. |
-| RMSE and MeanErr metrics | `train_mpri.py` and `evaluate_mpri.py` compute RMSE and mean Euclidean error. | Aligned. |
+| RMSE and MeanErr metrics | `train_mpri.py` and `evaluate_mpri.py` compute RMSE and mean Euclidean error; current eval also writes unified baseline metrics: mean, MSE, median, RMSE, CDF@1m, CDF@2m, P90, P95, P99, sample count. | Aligned and expanded for baseline reporting. |
 | Optimizer and batch size | Current paper text search did not locate explicit values; formal config uses Adam, batch size 32, weight decay 0.0. | Documented implementation choice. |
 | Gradient clipping, AMP, weight initialization | Code supports clipping and AMP; paper-style config disables AMP. Initialization/clipping are implementation details not found in paper text. | Non-paper extras; keep documented. |
+
+## BS And Sample Convention
+
+| Mode | Current convention |
+|---|---|
+| Single BS | Converter uses `bs_selection: random`, `bs_count: 1`, and `bs_seed` to choose one deterministic random representative BS per scene. A prediction row is a UE-BS pair. |
+| Multi BS | Converter uses `bs_selection: random`, `bs_count: 4`, and `bs_seed` to choose four deterministic random BS per scene. Padded output takes the UE union over those BS and zero-fills missing BS feature slots; strict output keeps only all-four-observed UE samples. |
+| Per-sample trace | Converted HDF5 metadata stores `valid_anchor_mask`, `global_anchor_ids`, and `source_link_ids`; evaluation exports `sample_kind`, `bs_set_ids`, `valid_bs_ids`, `valid_bs_count`, and `source_link_ids`. |
 
 ## Remaining Baseline Work
 
 | Item | Tracking |
 |---|---|
-| Run Front3D collection-level 400-epoch MPRI experiments and report scene/collection metrics | `FEAT-MPRI-001`; single-scene offline-noise evidence exists, collection-level formal test remains. |
-| Decide whether to add strongest-RSS single-BS contrast in addition to central-BS default | User review under MPRI row in central checklist |
+| Run Front3D collection-level 400-epoch MPRI experiments and report scene/collection metrics | `FEAT-MPRI-001`; previous local numbers are obsolete after the metric/BS convention update and should be regenerated. |
+| Use deterministic random single-BS representative instead of central/strongest-BS variants unless a later ablation explicitly requests otherwise | User convention for current baseline round |
 | Keep DeepMIMOFactory output contract stable for MPRI consumption | `STR-DATA-004` |
 | Accept Adam/batch-size/log-abs/2D-output choices as paper adaptations for current Front3D | User review under MPRI row in central checklist |
 
 ## Smoke Evidence
 
-| Data | Run | Test mean / median / P95 / RMSE when available |
-|---|---|---|
-| Front3D `front3d_5431` | `runs/eval/mpri_front3d_5431_smoke_eval-2026-07-05-16-03-48` | `2.925 / 2.728 / 3.261 m` |
-| DeepMIMO O1_3p5 legacy path-derived smoke | `runs/eval/mpri_deepmimo_o1_3p5_smoke_eval-2026-07-05-16-03-48` | `363.769 / 363.417 / 368.848 m` |
-| DeepMIMO O1_3p5 Factory axis-corrected smoke | `runs/eval/mpri_deepmimo_o1_3p5_smoke_eval-2026-07-06-13-49-47` | `382.858 / 382.845 / 382.895 / 382.858 m` |
-
-Current DeepMIMO input path has since been updated to consume offline CFR HDF5 from `DeepMIMOFactory`; the legacy path-derived smoke row is historical evidence only. The current smoke uses `cfr.shape=(16,16,2,768)`, selects 64 subcarriers, and applies the three SNR levels.
+Old smoke/evaluation numbers were intentionally removed from the active document because KNN/WKNN/MPRI results will be regenerated under the unified metric and BS convention. Current DeepMIMO input path consumes offline CFR HDF5 from `DeepMIMOFactory`; legacy path-derived smoke should not be reported.
 
 ## Offline-Noisy Single-Scene Evidence
 
-| Data | Config | Best checkpoint test mean / median / P95 / RMSE | Last checkpoint test mean / median / P95 / RMSE | Time |
-|---|---|---|---|---|
-| Front3D `front3d_0015`, noisy 50/20/10 dB | 193 subcarriers, 400 epochs | `0.572 / 0.480 / 1.279 / 0.690 m` at epoch 25 | `0.577 / 0.425 / 1.573 / 0.817 m` at epoch 400 | convert `0:30.37`, train `6:47.28` |
-| Front3D `front3d_0015`, noisy 50/20/10 dB | raw 768 subcarriers, 400 epochs | `0.558 / 0.458 / 1.333 / 0.687 m` at epoch 26 | `0.603 / 0.449 / 1.522 / 0.812 m` at epoch 400 | convert `1:01.03`, train `21:52.69` |
-
-Note: with `val_split=0`, `best.pt` is selected by test RMSE to mirror the paper-style per-epoch test evaluation. Use `last.pt` for a non-test-selected endpoint.
+Previous single-scene 400-epoch evidence is obsolete for reporting after the raw-subcarrier and BS-convention updates. With `val_split=0`, `best.pt` is selected by test RMSE to mirror the paper-style per-epoch test evaluation; use `last.pt` for a non-test-selected endpoint when formal numbers are regenerated.

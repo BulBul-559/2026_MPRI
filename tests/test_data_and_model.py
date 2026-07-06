@@ -6,7 +6,7 @@ import h5py
 import numpy as np
 import torch
 
-from scripts.convert_cfr_to_csi import build_dataset
+from scripts.convert_cfr_to_csi import build_dataset, select_cfr_bs
 from src.data import CFRDataset, split_indices_by_group
 from src.model import MPRINet, count_parameters
 
@@ -58,7 +58,20 @@ def test_front3d_converter_groups_links_by_ue(tmp_path: Path) -> None:
     assert data["features"].shape == (8, 16, 2, 12)
     assert data["labels"].shape == (12, 2)
     assert data["global_mobile_id"].tolist()[:3] == [0, 0, 0]
+    assert data["source_link_ids"].shape == (12, 2)
+    assert data["source_link_ids"][0].tolist() == [0, 1]
     assert sorted(set(data["snr_db"].astype(float).tolist())) == [10.0, 20.0, 50.0]
+
+
+def test_converter_supports_deterministic_random_bs_selection() -> None:
+    bs_ids = np.arange(10, dtype=np.int64)
+    cfg = _front3d_cfg()
+    cfg["dataset"]["scene_id"] = "front3d_unit"
+    cfg["front3d"] = {"bs_count": 4, "bs_selection": "random", "bs_seed": 2026}
+    selected = select_cfr_bs(bs_ids, cfg)
+    selected_again = select_cfr_bs(bs_ids, cfg)
+    assert selected.tolist() == [1, 2, 6, 8]
+    assert selected_again.tolist() == selected.tolist()
 
 
 def test_deepmimo_converter_consumes_offline_cfr(tmp_path: Path) -> None:

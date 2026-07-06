@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import math
 import re
 import sys
 import time
@@ -22,6 +21,7 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
 from src.data import CFRDataset, NormalizeTransform, split_indices_by_group
+from src.metrics import METRIC_COLUMNS, localization_metrics
 from src.model import MPRINet
 
 
@@ -96,6 +96,61 @@ class Metrics:
     loss: float      # RMSE Loss
     rmse: float      # Position RMSE (m)
     mean_err: float  # Mean Euclidean Error (m)
+    mse_m2: float = float("nan")
+    median_error_m: float = float("nan")
+    cdf_1m: float = float("nan")
+    cdf_2m: float = float("nan")
+    p90_error_m: float = float("nan")
+    p95_error_m: float = float("nan")
+    p99_error_m: float = float("nan")
+    valid_sample_count: int = 0
+
+
+def metrics_from_errors(loss: float, error_parts: list[np.ndarray]) -> Metrics:
+    if not error_parts:
+        return Metrics(float("nan"), float("nan"), float("nan"))
+    errors = np.concatenate(error_parts, axis=0)
+    stats = localization_metrics(errors)
+    return Metrics(
+        loss=loss,
+        rmse=float(stats["rmse_m"]),
+        mean_err=float(stats["mean_error_m"]),
+        mse_m2=float(stats["mse_m2"]),
+        median_error_m=float(stats["median_error_m"]),
+        cdf_1m=float(stats["cdf_1m"]),
+        cdf_2m=float(stats["cdf_2m"]),
+        p90_error_m=float(stats["p90_error_m"]),
+        p95_error_m=float(stats["p95_error_m"]),
+        p99_error_m=float(stats["p99_error_m"]),
+        valid_sample_count=int(stats["valid_sample_count"]),
+    )
+
+
+def prefixed_metric_row(prefix: str, metrics: Metrics) -> dict[str, float | int]:
+    return {
+        f"{prefix}_loss": metrics.loss,
+        f"{prefix}_rmse": metrics.rmse,
+        f"{prefix}_mean_err": metrics.mean_err,
+        f"{prefix}_mean_error_m": metrics.mean_err,
+        f"{prefix}_mse_m2": metrics.mse_m2,
+        f"{prefix}_median_error_m": metrics.median_error_m,
+        f"{prefix}_rmse_m": metrics.rmse,
+        f"{prefix}_cdf_1m": metrics.cdf_1m,
+        f"{prefix}_cdf_2m": metrics.cdf_2m,
+        f"{prefix}_p90_error_m": metrics.p90_error_m,
+        f"{prefix}_p95_error_m": metrics.p95_error_m,
+        f"{prefix}_p99_error_m": metrics.p99_error_m,
+        f"{prefix}_valid_sample_count": metrics.valid_sample_count,
+    }
+
+
+def prefixed_metric_fieldnames(prefix: str) -> list[str]:
+    return [
+        f"{prefix}_loss",
+        f"{prefix}_rmse",
+        f"{prefix}_mean_err",
+        *[f"{prefix}_{column}" for column in METRIC_COLUMNS],
+    ]
 
 
 def train_one_epoch(
@@ -113,9 +168,8 @@ def train_one_epoch(
     """
     model.train()
     running_loss = 0.0
-    running_sqerr = 0.0
-    running_mean_err = 0.0
     n_samples = 0
+    error_parts: list[np.ndarray] = []
 
     use_amp = scaler is not None and device.type == "cuda"
 
@@ -154,16 +208,13 @@ def train_one_epoch(
 
         # 统计
         running_loss += rmse_loss.item() * batch_size
-        running_sqerr += sq_norm.sum().item()
-        running_mean_err += torch.linalg.norm(diff, dim=-1).sum().item()
+        error_parts.append(torch.linalg.norm(diff.detach(), dim=-1).cpu().numpy())
         n_samples += batch_size
 
     if n_samples == 0:
         return Metrics(float("nan"), float("nan"), float("nan"))
     epoch_loss = running_loss / n_samples
-    rmse = math.sqrt(running_sqerr / n_samples)
-    mean_err = running_mean_err / n_samples
-    return Metrics(epoch_loss, rmse, mean_err)
+    return metrics_from_errors(epoch_loss, error_parts)
 
 
 @torch.no_grad()
@@ -176,9 +227,8 @@ def evaluate(
     """评估模型，返回 RMSE 和 Mean Error"""
     model.eval()
     running_loss = 0.0
-    running_sqerr = 0.0
-    running_mean_err = 0.0
     n_samples = 0
+    error_parts: list[np.ndarray] = []
     for inputs, targets in loader:
         inputs = inputs.to(device)
         targets = targets.to(device)
@@ -190,16 +240,13 @@ def evaluate(
         rmse_loss = torch.sqrt(mse + loss_eps)
 
         running_loss += rmse_loss.item() * inputs.size(0)
-        running_sqerr += sq_norm.sum().item()
-        running_mean_err += torch.linalg.norm(diff, dim=-1).sum().item()
+        error_parts.append(torch.linalg.norm(diff, dim=-1).cpu().numpy())
         n_samples += inputs.size(0)
 
     if n_samples == 0:
         return Metrics(float("nan"), float("nan"), float("nan"))
     epoch_loss = running_loss / n_samples
-    rmse = math.sqrt(running_sqerr / n_samples)
-    mean_err = running_mean_err / n_samples
-    return Metrics(epoch_loss, rmse, mean_err)
+    return metrics_from_errors(epoch_loss, error_parts)
 
 
 def build_dataloaders(
@@ -681,15 +728,9 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
     metrics_header = [
         "epoch",
         "lr",
-        "train_loss",
-        "train_rmse",
-        "train_mean_err",
-        "val_loss",
-        "val_rmse",
-        "val_mean_err",
-        "test_loss",
-        "test_rmse",
-        "test_mean_err",
+        *prefixed_metric_fieldnames("train"),
+        *prefixed_metric_fieldnames("val"),
+        *prefixed_metric_fieldnames("test"),
         "epoch_time_s",
         "is_best",
     ]
@@ -749,23 +790,12 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
                         best_ckpt_path,
                     )
 
-                csv_writer.writerow(
-                    {
-                        "epoch": epoch,
-                        "lr": current_lr,
-                        "train_loss": train_metrics.loss,
-                        "train_rmse": train_metrics.rmse,
-                        "train_mean_err": train_metrics.mean_err,
-                        "val_loss": val_metrics.loss,
-                        "val_rmse": val_metrics.rmse,
-                        "val_mean_err": val_metrics.mean_err,
-                        "test_loss": test_metrics.loss,
-                        "test_rmse": test_metrics.rmse,
-                        "test_mean_err": test_metrics.mean_err,
-                        "epoch_time_s": duration,
-                        "is_best": int(is_best),
-                    }
-                )
+                metric_row: dict[str, float | int] = {"epoch": epoch, "lr": current_lr}
+                metric_row.update(prefixed_metric_row("train", train_metrics))
+                metric_row.update(prefixed_metric_row("val", val_metrics))
+                metric_row.update(prefixed_metric_row("test", test_metrics))
+                metric_row.update({"epoch_time_s": duration, "is_best": int(is_best)})
+                csv_writer.writerow(metric_row)
                 csv_handle.flush()
 
                 writer.add_scalar("train/loss", train_metrics.loss, epoch)
