@@ -51,7 +51,7 @@ def main() -> None:
         data = build_dataset(files, cfg, require_all_anchors=False)
         report.update(
             {
-                "schema": "deepmimo_path_mat",
+                "schema": "deepmimo_offline_cfr_hdf5",
                 "root": str(files[0]),
                 "converted_feature_shape_whcn": [int(v) for v in data["features"].shape],
                 "converted_label_shape": [int(v) for v in data["labels"].shape],

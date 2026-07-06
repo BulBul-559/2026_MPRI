@@ -14,7 +14,7 @@ labels/position: (N, 2)
 
 `W` is the flattened CFR/image feature width, `H` is selected subcarriers, `C` is the BS/anchor depth, and `N` is samples. Configs must declare `dataset.format: front3d` or `dataset.format: deepmimo`. Data roots can be overridden with `BASELINE_FRONT3D_ROOT` and `BASELINE_DEEPMIMO_CFR_ROOT`.
 
-DeepMIMO production is intentionally outside this repository. MPRI consumes `deepmimo_cfr_v1` HDF5 scenes and then performs its own MPRI conversion plus optional SNR augmentation. It does not read DeepMIMO raw `.mat` files or synthesize CFR from path parameters.
+DeepMIMO production is intentionally outside this repository. MPRI consumes `deepmimo_cfr_v1` HDF5 scenes with `cfr` axes `[link, rx_ant, tx_ant, subcarrier]` and then performs its own MPRI conversion plus optional SNR augmentation. It does not read DeepMIMO raw `.mat` files or synthesize CFR from path parameters.
 
 ## Paper Alignment
 
@@ -46,6 +46,8 @@ BASELINE_DEEPMIMO_CFR_ROOT=/path/to/deepmimo_cfr_root \
 .venv/bin/python scripts/convert_cfr_to_csi.py \
   --config config/data/deepmimo_o1_3p5_smoke.yaml --overwrite
 ```
+
+The current DeepMIMO smoke source is the axis-corrected Factory export with `cfr.shape == (16, 16, 2, 768)`. The MPRI smoke config selects 64 subcarriers and writes 24 samples from 8 UE x 3 SNR levels.
 
 ## Single-Scene 400-Epoch Evidence
 

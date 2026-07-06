@@ -22,6 +22,8 @@ def _write_front3d_scene(path: Path) -> None:
     ).astype(np.complex64)
     target_xy = np.stack([ue_ids.astype(np.float32), ue_ids.astype(np.float32) + 10.0], axis=1)
     with h5py.File(path, "w") as f:
+        f.attrs["cfr_axes"] = '["link", "rx_ant", "tx_ant", "subcarrier"]'
+        f.create_dataset("cfr_axes", data=np.bytes_('["link", "rx_ant", "tx_ant", "subcarrier"]'))
         f.create_dataset("cfr", data=cfr)
         f.create_dataset("target_xy", data=target_xy)
         f.create_dataset("ue_id", data=ue_ids)

@@ -44,6 +44,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "compression": "lzf",
     "runs": {"root": "runs", "experiment_name": "convert_mpri"},
 }
+EXPECTED_DEEPMIMO_CFR_AXES = ("link", "rx_ant", "tx_ant", "subcarrier")
 
 
 def parse_args() -> argparse.Namespace:
@@ -166,6 +167,51 @@ def choose_subcarriers(num_subcarriers: int, policy: str, count: int) -> np.ndar
     raise ValueError(f"Unsupported subcarrier policy: {policy}")
 
 
+def _read_text_dataset(f: h5py.File, key: str, default: str = "") -> str:
+    if key not in f:
+        return default
+    value = f[key][()]
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, np.ndarray):
+        value = value.item()
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+    return str(value)
+
+
+def _contract_version(f: h5py.File) -> str:
+    value = f.attrs.get("contract_version", "")
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _read_cfr_axes(f: h5py.File) -> tuple[str, ...] | None:
+    raw: Any
+    if "cfr_axes" in f:
+        raw = _read_text_dataset(f, "cfr_axes")
+    elif "cfr_axes" in f.attrs:
+        raw = f.attrs["cfr_axes"]
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+    else:
+        return None
+    if isinstance(raw, (list, tuple, np.ndarray)):
+        axes = [str(x) for x in raw]
+    else:
+        axes = json.loads(str(raw))
+    return tuple(str(axis) for axis in axes)
+
+
+def validate_deepmimo_cfr_axes(f: h5py.File, path: Path) -> None:
+    if _contract_version(f) != "deepmimo_cfr_v1":
+        return
+    axes = _read_cfr_axes(f)
+    if axes != EXPECTED_DEEPMIMO_CFR_AXES:
+        raise ValueError(f"{path} has cfr_axes={axes}; expected {EXPECTED_DEEPMIMO_CFR_AXES}")
+
+
 def augmentation_levels(cfg: dict[str, Any]) -> list[float | None]:
     aug = cfg["augmentation"]
     if not aug["enabled"]:
@@ -234,6 +280,7 @@ def build_cfr_dataset(files: list[Path], cfg: dict[str, Any], require_all_anchor
         with h5py.File(path, "r") as f:
             if "cfr" not in f or "target_xy" not in f:
                 raise ValueError(f"{path} is not an offline CFR scene file.")
+            validate_deepmimo_cfr_axes(f, path)
             cfr = np.asarray(f["cfr"])
             labels = np.asarray(f["target_xy"], dtype=np.float32)
             ue_ids = np.asarray(f["ue_id"] if "ue_id" in f else np.arange(cfr.shape[0]), dtype=np.int64)

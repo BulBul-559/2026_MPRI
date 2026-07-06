@@ -20,7 +20,7 @@ Evidence reviewed:
 | Noise augmentation | Partially aligned: SNR levels and augmentation multiplicity match the paper, but current data lacks PHY `Filter_multipath`, so AWGN is applied to offline CFR. |
 | Dataset/split | Adapted: the paper uses its two generated scenarios and 3D labels; current Front3D uses project-level UE split and 2D `(x, y)` labels. |
 | Optimizer/batch | Paper text inspected here did not specify them. Current paper-style config uses Adam, batch size 32, weight decay 0.0; this remains a documented implementation choice. |
-| DeepMIMO | Adapted through shared offline CFR: DeepMIMO v3/v4 production is owned by `DeepMIMOFactory`; MPRI only reads the produced `deepmimo_cfr_v1` HDF5 and applies the same conversion/noise path as Front3D. |
+| DeepMIMO | Adapted through shared offline CFR: DeepMIMO v3/v4 production is owned by `DeepMIMOFactory`; MPRI only reads the produced `deepmimo_cfr_v1` HDF5 with `cfr` axes `[link, rx_ant, tx_ant, subcarrier]` and applies the same conversion/noise path as Front3D. |
 
 ## Paper-To-Code Mapping
 
@@ -64,12 +64,13 @@ Evidence reviewed:
 
 ## Smoke Evidence
 
-| Data | Run | Test mean / median / P95 |
+| Data | Run | Test mean / median / P95 / RMSE when available |
 |---|---|---|
 | Front3D `front3d_5431` | `runs/eval/mpri_front3d_5431_smoke_eval-2026-07-05-16-03-48` | `2.925 / 2.728 / 3.261 m` |
 | DeepMIMO O1_3p5 legacy path-derived smoke | `runs/eval/mpri_deepmimo_o1_3p5_smoke_eval-2026-07-05-16-03-48` | `363.769 / 363.417 / 368.848 m` |
+| DeepMIMO O1_3p5 Factory axis-corrected smoke | `runs/eval/mpri_deepmimo_o1_3p5_smoke_eval-2026-07-06-13-49-47` | `382.858 / 382.845 / 382.895 / 382.858 m` |
 
-Current DeepMIMO input path has since been updated to consume offline CFR HDF5 from `DeepMIMOFactory`; the legacy path-derived smoke row is historical evidence only.
+Current DeepMIMO input path has since been updated to consume offline CFR HDF5 from `DeepMIMOFactory`; the legacy path-derived smoke row is historical evidence only. The current smoke uses `cfr.shape=(16,16,2,768)`, selects 64 subcarriers, and applies the three SNR levels.
 
 ## Offline-Noisy Single-Scene Evidence
 
