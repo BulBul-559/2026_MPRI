@@ -1,8 +1,12 @@
 dataset:
   format: front3d
-  root_env: BASELINE_FRONT3D_ROOT
+  root_env: BASELINE_FRONT3D_NOISE_ROOT
   root: ../data/Front3d_2988_CFR_Only/noise_sub_test_set
   scene_id: front3d_0015
+  require_complete_build: true
+  expected_scene_count: 339
+  expected_noise_snr_count: 3
+  allow_incomplete_noise: false
 output_dir: data/processed/front3d_noise_sub_0015_smoke
 label_dims: 2
 representation: log_abs

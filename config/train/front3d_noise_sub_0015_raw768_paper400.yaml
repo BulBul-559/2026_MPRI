@@ -31,7 +31,7 @@ training:
   epochs: 400
   batch_size: 16
   seed: 2026
-  device: cuda:1
+  device: cuda:0
   amp: false
   max_norm: 5.0
 

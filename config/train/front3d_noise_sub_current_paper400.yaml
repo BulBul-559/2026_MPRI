@@ -1,0 +1,41 @@
+experiment:
+  name: mpri_front3d_noise_sub_current_paper400
+  output_root: runs/train
+
+data:
+  dataset: data/processed/front3d_noise_sub_current_paper400/csi_padded_log_abs_193_offline_snr3.h5
+  train_split: 0.80
+  val_split: 0.00
+  test_split: 0.20
+  split_strategy: ue_level
+
+model:
+  dropout: 0.2
+  output_dim: 2
+
+optimizer:
+  type: Adam
+  learning_rate: 0.001
+  weight_decay: 0.0
+
+scheduler:
+  type: StepLR
+  step_size: 50
+  gamma: 0.3
+
+loss:
+  type: rmse
+  eps: 1.0e-8
+
+training:
+  epochs: 400
+  batch_size: 16
+  seed: 2026
+  device: cuda:0
+  amp: false
+  max_norm: 5.0
+
+logging:
+  save_loss_figure: true
+  loss_figure_name: loss_curve.png
+  evaluate_test_each_epoch: true

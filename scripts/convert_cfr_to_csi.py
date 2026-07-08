@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -30,7 +31,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "representation": "log_abs",
     "eps": 1.0e-8,
     "sample_limit": None,
-    "subcarriers": {"policy": "uniform", "count": 193},
+    "subcarriers": {"policy": "first", "count": 768},
     "augmentation": {
         "enabled": False,
         "snr_db": [50.0, 20.0, 10.0],
@@ -39,8 +40,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "front3d": {"bs_ids": None, "max_bs": None, "bs_count": None, "bs_selection": "random", "bs_seed": 2026},
     "outputs": {
-        "strict_name": "csi_strict_log_abs_193.h5",
-        "padded_name": "csi_padded_log_abs_193.h5",
+        "strict_name": "csi_strict_log_abs_768.h5",
+        "padded_name": "csi_padded_log_abs_768.h5",
     },
     "compression": "lzf",
     "runs": {"root": "runs", "experiment_name": "convert_mpri"},
@@ -82,6 +83,16 @@ def load_config(path: Path) -> dict[str, Any]:
     dataset["format"] = fmt
     dataset.pop("key", None)
     dataset["root"] = str(_resolve_root(dataset))
+    if dataset.get("scene_ids") is not None or dataset.get("scene_ids_file") is not None:
+        dataset["scene_id"] = None
+    if dataset.get("scene_limit") is not None:
+        dataset["scene_limit"] = int(dataset["scene_limit"])
+    if dataset.get("expected_scene_count") is not None:
+        dataset["expected_scene_count"] = int(dataset["expected_scene_count"])
+    if dataset.get("expected_noise_snr_count") is not None:
+        dataset["expected_noise_snr_count"] = int(dataset["expected_noise_snr_count"])
+    dataset["allow_incomplete_noise"] = bool(dataset.get("allow_incomplete_noise", False))
+    dataset["require_complete_build"] = bool(dataset.get("require_complete_build", False))
     cfg["label_dims"] = int(cfg["label_dims"])
     cfg["representation"] = str(cfg["representation"])
     if cfg["representation"] not in {"log_abs", "amp_phase", "real_imag"}:
@@ -141,6 +152,16 @@ def input_files(cfg: dict[str, Any]) -> list[Path]:
     dataset = cfg["dataset"]
     root = Path(dataset["root"])
     if dataset["format"] in {"front3d", "deepmimo"}:
+        scene_ids = _resolve_scene_ids(dataset)
+        _validate_noise_build_status(dataset, scene_ids)
+        if scene_ids:
+            files = []
+            for scene_id in scene_ids:
+                path = root / "scenes" / f"{scene_id}.h5"
+                if not path.exists():
+                    raise FileNotFoundError(f"CFR scene not found: {path}")
+                files.append(path)
+            return files
         scene_id = dataset.get("scene_id")
         if scene_id:
             path = root / "scenes" / f"{scene_id}.h5"
@@ -154,6 +175,99 @@ def input_files(cfg: dict[str, Any]) -> list[Path]:
             raise FileNotFoundError(f"No CFR .h5 files found under {root}")
         return files
     return [root]
+
+
+def _resolve_scene_ids(dataset: dict[str, Any]) -> list[str]:
+    scene_ids: list[str] = []
+    configured = dataset.get("scene_ids")
+    if configured is not None:
+        if isinstance(configured, str):
+            scene_ids.extend(_split_scene_ids(configured))
+        else:
+            scene_ids.extend(str(v).strip() for v in configured if str(v).strip())
+
+    scene_ids_file = dataset.get("scene_ids_file")
+    if scene_ids_file:
+        path = Path(str(scene_ids_file))
+        if not path.is_absolute():
+            path = Path(dataset["root"]) / path
+        if not path.exists():
+            raise FileNotFoundError(f"scene_ids_file not found: {path}")
+        for line in path.read_text(encoding="utf-8").splitlines():
+            value = line.strip()
+            if value and not value.startswith("#"):
+                scene_ids.append(value)
+
+    scene_ids = list(dict.fromkeys(scene_ids))
+    limit = dataset.get("scene_limit")
+    if limit is not None:
+        scene_ids = scene_ids[: int(limit)]
+    return scene_ids
+
+
+def _split_scene_ids(value: str) -> list[str]:
+    return [item.strip() for item in value.replace(",", "\n").splitlines() if item.strip()]
+
+
+def _validate_noise_build_status(dataset: dict[str, Any], requested_scene_ids: list[str]) -> None:
+    if bool(dataset.get("allow_incomplete_noise", False)):
+        return
+    root = Path(dataset["root"])
+    status_path = root / "build_status.csv"
+    require_complete = bool(dataset.get("require_complete_build", False))
+    if not require_complete and not status_path.exists():
+        return
+    if not status_path.exists():
+        raise FileNotFoundError(f"Noise build status CSV not found: {status_path}")
+
+    with status_path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise ValueError(f"Noise build status CSV is empty: {status_path}")
+
+    expected_scene_count = dataset.get("expected_scene_count")
+    if expected_scene_count is not None and len(rows) != int(expected_scene_count):
+        raise ValueError(
+            f"Noise build status has {len(rows)} rows; expected {int(expected_scene_count)} for current dataset."
+        )
+
+    by_scene = {str(row.get("scene_id", "")).strip(): row for row in rows}
+    if requested_scene_ids:
+        missing_rows = [scene_id for scene_id in requested_scene_ids if scene_id not in by_scene]
+        if missing_rows:
+            raise ValueError(f"Noise build status is missing requested scenes: {missing_rows[:5]}")
+        rows_to_check = [by_scene[scene_id] for scene_id in requested_scene_ids]
+    else:
+        rows_to_check = rows
+
+    bad_status = [
+        (row.get("scene_id", ""), row.get("status", ""))
+        for row in rows_to_check
+        if str(row.get("status", "")).strip().lower() != "completed"
+    ]
+    if bad_status:
+        preview = ", ".join(f"{scene}:{status}" for scene, status in bad_status[:5])
+        raise ValueError(f"Noise build is not complete for requested scenes: {preview}")
+
+    expected_snr_count = dataset.get("expected_noise_snr_count")
+    if expected_snr_count is not None:
+        wrong_snr = [
+            (row.get("scene_id", ""), row.get("noise_snr_count", ""))
+            for row in rows_to_check
+            if int(row.get("noise_snr_count") or -1) != int(expected_snr_count)
+        ]
+        if wrong_snr:
+            preview = ", ".join(f"{scene}:{count}" for scene, count in wrong_snr[:5])
+            raise ValueError(f"Noise SNR count does not match expected {int(expected_snr_count)}: {preview}")
+
+    missing_h5 = []
+    for row in rows_to_check:
+        scene_id = str(row.get("scene_id", "")).strip()
+        h5_path = root / "scenes" / f"{scene_id}.h5"
+        if scene_id and not h5_path.exists():
+            missing_h5.append(scene_id)
+    if missing_h5:
+        raise FileNotFoundError(f"Completed noise scenes are missing HDF5 files: {missing_h5[:5]}")
 
 
 def choose_subcarriers(num_subcarriers: int, policy: str, count: int) -> np.ndarray:

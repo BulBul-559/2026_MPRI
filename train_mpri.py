@@ -56,10 +56,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "eps": 1e-8,
     },
     "training": {
-        "epochs": 400,
+        "epochs": 60,
         "batch_size": 32,
         "seed": 3407,
-        "device": "cuda",
+        "device": "cuda:0",
         "amp": False,
         "max_norm": 5.0,
     },
@@ -258,6 +258,7 @@ def build_dataloaders(
     split_strategy: str,
     seed: int,
     overfit_n: int | None = None,
+    split_plan_dir: str | Path | None = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, Any], Dict[str, Any]]:
     """构建训练和验证 DataLoader。
 
@@ -273,7 +274,12 @@ def build_dataloaders(
 
     # 按 group 切分，主口径为 global_mobile_id（UE/location 级）。
     group_ids = base_dataset.group_ids(split_strategy)
-    splits = split_indices_by_group(group_ids, train_split, val_split, test_split, seed)
+    if split_plan_dir is not None and str(split_plan_dir).strip():
+        splits = split_indices_from_plan(base_dataset, split_plan_dir)
+        split_source = str(Path(split_plan_dir))
+    else:
+        splits = split_indices_by_group(group_ids, train_split, val_split, test_split, seed)
+        split_source = "ratio_split"
 
     train_indices_tensor = torch.tensor(splits["train"], dtype=torch.long)
     val_indices_tensor = torch.tensor(splits["val"], dtype=torch.long)
@@ -281,6 +287,7 @@ def build_dataloaders(
 
     print(f"数据集总样本数: {dataset_size}", flush=True)
     print(f"split_strategy: {split_strategy}", flush=True)
+    print(f"split_source: {split_source}", flush=True)
     print(f"唯一 group 数: {len(np.unique(group_ids))}", flush=True)
     print(f"训练样本数: {len(train_indices_tensor)}", flush=True)
     print(f"验证样本数: {len(val_indices_tensor)}", flush=True)
@@ -345,8 +352,55 @@ def build_dataloaders(
         "train_split": train_split,
         "val_split": val_split,
         "test_split": test_split,
+        "split_source": split_source,
+        "split_plan_dir": str(split_plan_dir) if split_plan_dir is not None else "",
     }
     return train_loader, val_loader, test_loader, stats, split_info
+
+
+def split_indices_from_plan(dataset: CFRDataset, split_plan_dir: str | Path) -> Dict[str, List[int]]:
+    """Assign converted samples with a Front3D single-scene UE split plan."""
+    plan_dir = Path(split_plan_dir)
+    if not plan_dir.is_dir():
+        raise FileNotFoundError(f"split_plan_dir not found: {plan_dir}")
+
+    mobile_ids = dataset.metadata_array("global_mobile_id")
+    if mobile_ids is None:
+        mobile_ids = dataset.metadata_array("global_tx_id")
+    if mobile_ids is None:
+        raise ValueError("Predefined split requires metadata/global_mobile_id or metadata/global_tx_id.")
+    mobile_ids = np.asarray(mobile_ids, dtype=np.int64).reshape(-1)
+
+    ue_to_split: Dict[int, str] = {}
+    for split_name in ("train", "val", "test"):
+        path = plan_dir / f"{split_name}_links.pt"
+        if not path.exists():
+            raise FileNotFoundError(f"Split plan file not found: {path}")
+        plan = torch.load(path, map_location="cpu", weights_only=False)
+        if "ue_id" not in plan:
+            raise ValueError(f"Split plan does not contain ue_id: {path}")
+        ue_values = plan["ue_id"].cpu().numpy() if hasattr(plan["ue_id"], "cpu") else np.asarray(plan["ue_id"])
+        for ue_id in np.unique(ue_values.astype(np.int64)):
+            previous = ue_to_split.get(int(ue_id))
+            if previous is not None and previous != split_name:
+                raise ValueError(f"UE {int(ue_id)} appears in both {previous} and {split_name} split plans.")
+            ue_to_split[int(ue_id)] = split_name
+
+    splits: Dict[str, List[int]] = {"train": [], "val": [], "test": []}
+    missing: Set[int] = set()
+    for index, ue_id in enumerate(mobile_ids.tolist()):
+        split_name = ue_to_split.get(int(ue_id))
+        if split_name is None:
+            missing.add(int(ue_id))
+            continue
+        splits[split_name].append(index)
+    if missing:
+        raise ValueError(f"Converted dataset contains UE ids absent from split plan: {sorted(missing)[:10]}")
+    if not splits["train"]:
+        raise ValueError(f"Predefined split has no train samples for dataset {dataset.data_path}")
+    if not splits["test"]:
+        raise ValueError(f"Predefined split has no test samples for dataset {dataset.data_path}")
+    return splits
 
 
 def parse_args() -> argparse.Namespace:
@@ -366,6 +420,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-split", type=float, default=None, help="覆盖 data.val_split")
     parser.add_argument("--test-split", type=float, default=None, help="覆盖 data.test_split")
     parser.add_argument("--split-strategy", type=str, default=None, help="覆盖 data.split_strategy")
+    parser.add_argument("--split-plan-dir", type=Path, default=None, help="Override data.split_plan_dir")
     parser.add_argument("--seed", type=int, default=None, help="覆盖 training.seed")
     parser.add_argument("--device", type=str, default=None, help="覆盖 training.device")
     parser.add_argument("--max-norm", type=float, default=None, help="覆盖 training.max_norm")
@@ -461,6 +516,8 @@ def apply_cli_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Non
         config["data"]["test_split"] = args.test_split
     if args.split_strategy is not None:
         config["data"]["split_strategy"] = args.split_strategy
+    if args.split_plan_dir is not None:
+        config["data"]["split_plan_dir"] = str(args.split_plan_dir)
     if args.seed is not None:
         config["training"]["seed"] = args.seed
     if args.device is not None:
@@ -505,6 +562,8 @@ def validate_and_normalize_config(config: Dict[str, Any]) -> None:
     config["experiment"]["output_root"] = str(config["experiment"].get("output_root", "runs"))
     config["data"]["dataset"] = str(config["data"].get("dataset", "data/csi/csi_strict.h5"))
     config["data"]["split_strategy"] = str(config["data"].get("split_strategy", "position_level"))
+    if config["data"].get("split_plan_dir") is not None:
+        config["data"]["split_plan_dir"] = str(config["data"]["split_plan_dir"])
     config["data"]["train_split"] = float(config["data"].get("train_split", 1.0 - float(config["data"].get("val_split", 0.2)) - float(config["data"].get("test_split", 0.0))))
     config["data"]["val_split"] = float(config["data"].get("val_split", 0.2))
     config["data"]["test_split"] = float(config["data"].get("test_split", 0.0))
@@ -523,10 +582,10 @@ def validate_and_normalize_config(config: Dict[str, Any]) -> None:
     config["loss"]["type"] = str(config["loss"].get("type", "rmse"))
     config["loss"]["eps"] = float(config["loss"].get("eps", 1e-8))
 
-    config["training"]["epochs"] = int(config["training"].get("epochs", 400))
+    config["training"]["epochs"] = int(config["training"].get("epochs", 60))
     config["training"]["batch_size"] = int(config["training"].get("batch_size", 32))
     config["training"]["seed"] = int(config["training"].get("seed", 3407))
-    config["training"]["device"] = str(config["training"].get("device", "cuda"))
+    config["training"]["device"] = str(config["training"].get("device", "cuda:0"))
     config["training"]["amp"] = bool(config["training"].get("amp", False))
     config["training"]["max_norm"] = float(config["training"].get("max_norm", 5.0))
 
@@ -648,6 +707,7 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
     val_split = float(config["data"]["val_split"])
     test_split = float(config["data"]["test_split"])
     split_strategy = str(config["data"]["split_strategy"])
+    split_plan_dir = config["data"].get("split_plan_dir")
     dropout = float(config["model"]["dropout"])
     output_dim = int(config["model"]["output_dim"])
     lr = float(config["optimizer"]["learning_rate"])
@@ -695,6 +755,7 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
         test_split,
         split_strategy,
         seed,
+        split_plan_dir=split_plan_dir,
     )
 
     n_train = len(train_loader.dataset)

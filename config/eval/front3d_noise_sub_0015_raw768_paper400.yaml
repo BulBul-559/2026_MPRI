@@ -8,5 +8,5 @@ data:
 
 eval:
   batch_size: 32
-  device: cuda:1
+  device: cuda:0
   save_predictions: true

@@ -1,0 +1,12 @@
+experiment:
+  name: mpri_front3d_noise_sub_0015_singlebs_paper400_eval
+  output_root: runs/eval
+
+data:
+  dataset: data/processed/front3d_noise_sub_0015_singlebs_paper400/csi_padded_log_abs_193_offline_snr3.h5
+  split: test
+
+eval:
+  batch_size: 32
+  device: cuda:0
+  save_predictions: true
