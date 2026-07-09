@@ -23,7 +23,9 @@ not from the legacy paper-style example configs. The current reporting standard 
 
 - Dataset: `Front3d_2988_CFR_Only/noise_sub_test_set`
 - Split protocol: `m117_single_scene_ue_level`, one independent task per test-scene-pool scene
-- BS mode: deterministic-random single BS with `bs_seed: 2026`
+- Split source: `train_links.pt`, `val_links.pt`, and `test_links.pt` under each scene's m117 UE-level split directory
+- Link eligibility: the m117 link plan is the source of truth; conversion must not admit raw HDF5 links based only on `valid_mask`
+- BS mode: read `single_bs_ids` or `multi_bs_ids` from the canonical `bs_selection_v1` contract
 - Subcarriers: raw 768 with `subcarriers.policy: first`
 - Training: 60 epochs on `cuda:0`
 - Selection/eval: `best.pt` selected by validation RMSE, then `evaluate_mpri.py` on the scene `test` split
@@ -116,13 +118,21 @@ reproducible (`bs_selection: random`, `bs_seed: 2026`, plus the scene-id hash),
 but new baselines should read the contract instead of independently selecting
 BS IDs. Explicit `bs_ids` overrides automatic selection in the converter.
 
+For formal Front3D M117 conversion, the converter must receive
+`dataset.split_plan_dir` or `front3d.split_plan_dir`. It filters source HDF5
+rows by the union of `train_links.pt`, `val_links.pt`, and `test_links.pt`.
+For the noisy Front3D dataset this filter is applied through
+`noise/source_local_link_index`, so expanded SNR rows still inherit the clean
+m117 link eligibility. A converted HDF5 containing a UE or source link outside
+the split plan is invalid and must be regenerated.
+
 For formal multi-BS baseline runs, use the padded output. Padded samples keep
 the fixed per-scene `bs_set_ids`, fill missing selected-BS feature slots with
 zero, and expose the per-sample available subset as `valid_bs_ids`. Strict
 output keeps only UE samples observed by all selected BS and is reserved for
 explicit ablations.
 
-For the current Front3D test scene pool, MPRI must use the predefined per-scene UE split plan under `m117_single_scene_ue_level`. Training configs can set `data.split_plan_dir` or pass `--split-plan-dir`; when present, `train_mpri.py` uses that split plan instead of creating a second random split inside the converted HDF5.
+For the current Front3D test scene pool, MPRI must use the predefined per-scene UE split plan under `m117_single_scene_ue_level`. Training configs can set `data.split_plan_dir` or pass `--split-plan-dir`; when present, `train_mpri.py` uses that split plan instead of creating a second random split inside the converted HDF5. This training split is a second guard; the conversion stage must already have applied the same m117 link plan filter.
 
 ## Metrics And Outputs
 

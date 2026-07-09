@@ -402,6 +402,7 @@ def build_cfr_dataset(files: list[Path], cfg: dict[str, Any], require_all_anchor
             ue_ids = np.asarray(f["ue_id"] if "ue_id" in f else np.arange(cfr.shape[0]), dtype=np.int64)
             bs_ids = np.asarray(f["bs_id"] if "bs_id" in f else np.zeros(cfr.shape[0], dtype=np.int64), dtype=np.int64)
             valid = np.asarray(f["valid_mask"] if "valid_mask" in f else np.ones(cfr.shape[0], dtype=bool), dtype=bool)
+            valid = apply_front3d_m117_link_plan_filter(f, cfg, valid)
             noise_level = np.asarray(f["noise/noise_level_index"], dtype=np.int64) if "noise/noise_level_index" in f else None
             source_snr = np.asarray(f["noise/snr_db"], dtype=np.float32) if "noise/snr_db" in f else None
             if subcarrier_indices is None:
@@ -559,6 +560,61 @@ def cfr_sample_rows(
     return rows
 
 
+def apply_front3d_m117_link_plan_filter(f: h5py.File, cfg: dict[str, Any], valid: np.ndarray) -> np.ndarray:
+    plan_dir = resolve_m117_split_plan_dir(cfg)
+    if plan_dir is None:
+        return valid
+    allowed = load_m117_source_link_indices(plan_dir)
+    if allowed.size == 0:
+        raise ValueError(f"M117 split plan has no links: {plan_dir}")
+    if "noise/source_local_link_index" in f:
+        source_idx = np.asarray(f["noise/source_local_link_index"], dtype=np.int64)
+    elif "source_local_link_index" in f:
+        source_idx = np.asarray(f["source_local_link_index"], dtype=np.int64)
+    else:
+        source_idx = np.arange(valid.shape[0], dtype=np.int64)
+    if source_idx.shape[0] != valid.shape[0]:
+        raise ValueError(
+            "M117 source index length mismatch: "
+            f"{source_idx.shape[0]} source indices for {valid.shape[0]} HDF5 rows"
+        )
+    filtered = valid & np.isin(source_idx, allowed)
+    if not np.any(filtered):
+        raise ValueError(f"No HDF5 rows remain after applying M117 split plan: {plan_dir}")
+    return filtered
+
+
+def resolve_m117_split_plan_dir(cfg: dict[str, Any]) -> Path | None:
+    front_cfg = cfg.get("front3d", {}) or {}
+    dataset_cfg = cfg.get("dataset", {}) or {}
+    value = front_cfg.get("split_plan_dir", dataset_cfg.get("split_plan_dir"))
+    if value is None or str(value).strip() == "":
+        return None
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path.resolve()
+
+
+def load_m117_source_link_indices(plan_dir: Path) -> np.ndarray:
+    try:
+        import torch
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("M117 split plans require torch to read train/val/test_links.pt") from exc
+    parts: list[np.ndarray] = []
+    for split_name in ("train", "val", "test"):
+        path = plan_dir / f"{split_name}_links.pt"
+        if not path.exists():
+            raise FileNotFoundError(f"M117 split file not found: {path}")
+        plan = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(plan, dict) or "local_link_index" not in plan:
+            raise ValueError(f"{path} must contain local_link_index")
+        values = plan["local_link_index"]
+        values = values.detach().cpu().numpy() if hasattr(values, "detach") else np.asarray(values)
+        parts.append(np.asarray(values, dtype=np.int64).reshape(-1))
+    return np.unique(np.concatenate(parts, axis=0)).astype(np.int64)
+
+
 def append_cfr_row(
     rows: list[tuple[int, dict[int, int], np.ndarray, float | None]],
     ue: int,
@@ -580,6 +636,9 @@ def append_cfr_row(
 
 def select_cfr_bs(bs_ids: np.ndarray, cfg: dict[str, Any]) -> np.ndarray:
     front_cfg = cfg.get("front3d", {})
+    contract_ids = select_cfr_bs_from_contract(bs_ids, cfg)
+    if contract_ids is not None:
+        return contract_ids
     requested = front_cfg.get("bs_ids")
     if requested:
         values = np.asarray([int(v) for v in requested], dtype=np.int64)
@@ -591,6 +650,79 @@ def select_cfr_bs(bs_ids: np.ndarray, cfg: dict[str, Any]) -> np.ndarray:
     if values.size == 0:
         raise ValueError("No BS ids selected.")
     return np.asarray(values, dtype=np.int64)
+
+
+def select_cfr_bs_from_contract(bs_ids: np.ndarray, cfg: dict[str, Any]) -> np.ndarray | None:
+    front_cfg = cfg.get("front3d", {}) or {}
+    contract_value = front_cfg.get("bs_contract", front_cfg.get("bs_contract_path"))
+    if contract_value is None or str(contract_value).strip() == "":
+        return None
+    contract_path = Path(str(contract_value)).expanduser()
+    if not contract_path.is_absolute():
+        contract_path = Path.cwd() / contract_path
+    contract_path = contract_path.resolve()
+    if not contract_path.exists():
+        raise FileNotFoundError(f"BS selection contract not found: {contract_path}")
+    scene_id = str((cfg.get("dataset", {}) or {}).get("scene_id") or "").strip()
+    if not scene_id:
+        raise ValueError("dataset.scene_id is required when front3d.bs_contract is configured")
+    if contract_path.suffix.lower() == ".csv":
+        contract, record = read_bs_contract_csv(contract_path, scene_id)
+    else:
+        contract, record = read_bs_contract_json(contract_path, scene_id)
+    key = front_cfg.get("bs_contract_key")
+    if key is None:
+        bs_count = front_cfg.get("bs_count", front_cfg.get("max_bs"))
+        key = "single_bs_ids" if bs_count is not None and int(bs_count) == 1 else "multi_bs_ids"
+    selected = np.asarray(parse_contract_bs_field(record.get(str(key))), dtype=np.int64)
+    if selected.size == 0:
+        raise ValueError(f"BS contract {contract_path} has empty {key} for {scene_id}")
+    available = set(int(v) for v in np.unique(bs_ids.astype(np.int64)).tolist())
+    missing = [int(v) for v in selected.tolist() if int(v) not in available]
+    if missing:
+        raise ValueError(f"BS contract selects unavailable BS ids for {scene_id}: {missing}; available={sorted(available)}")
+    front_cfg["_resolved_bs_selection"] = {
+        "source": "bs_contract",
+        "contract_path": str(contract_path),
+        "schema_version": contract.get("schema_version"),
+        "contract_id": contract.get("contract_id"),
+        "scene_id": scene_id,
+        "bs_contract_key": str(key),
+        "selected_bs_ids": [int(v) for v in selected.tolist()],
+    }
+    return selected.astype(np.int64)
+
+
+def read_bs_contract_json(path: Path, scene_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    with path.open("r", encoding="utf-8-sig") as handle:
+        contract = json.load(handle)
+    scenes = contract.get("scenes", contract) if isinstance(contract, dict) else contract
+    for record in scenes:
+        if str(record.get("scene_id", "")) == scene_id:
+            return contract if isinstance(contract, dict) else {}, record
+    raise KeyError(f"Scene {scene_id!r} not found in BS contract {path}")
+
+
+def read_bs_contract_csv(path: Path, scene_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        for record in csv.DictReader(handle):
+            if str(record.get("scene_id", "")) == scene_id:
+                return {}, record
+    raise KeyError(f"Scene {scene_id!r} not found in BS contract {path}")
+
+
+def parse_contract_bs_field(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            value = json.loads(text)
+        else:
+            value = [part.strip() for part in text.split(",") if part.strip()]
+    return [int(v) for v in value]
 
 
 def _select_bs_subset(values: np.ndarray, count: int, cfg: dict[str, Any]) -> np.ndarray:

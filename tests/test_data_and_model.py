@@ -136,6 +136,46 @@ def test_front3d_converter_groups_links_by_ue(tmp_path: Path) -> None:
     assert sorted(set(data["snr_db"].astype(float).tolist())) == [10.0, 20.0, 50.0]
 
 
+def test_front3d_converter_filters_to_m117_link_plan(tmp_path: Path) -> None:
+    scene = tmp_path / "front3d_unit.h5"
+    _write_front3d_scene(scene)
+    plan_dir = tmp_path / "front3d_unit_seed2026_ue_level"
+    plan_dir.mkdir()
+    torch.save(
+        {
+            "local_link_index": torch.tensor([0, 1, 2, 3], dtype=torch.long),
+            "ue_id": torch.tensor([0, 0, 1, 1], dtype=torch.long),
+            "bs_id": torch.tensor([0, 1, 0, 1], dtype=torch.long),
+        },
+        plan_dir / "train_links.pt",
+    )
+    torch.save(
+        {
+            "local_link_index": torch.tensor([4, 5], dtype=torch.long),
+            "ue_id": torch.tensor([2, 2], dtype=torch.long),
+            "bs_id": torch.tensor([0, 1], dtype=torch.long),
+        },
+        plan_dir / "val_links.pt",
+    )
+    torch.save(
+        {
+            "local_link_index": torch.tensor([6, 7], dtype=torch.long),
+            "ue_id": torch.tensor([3, 3], dtype=torch.long),
+            "bs_id": torch.tensor([0, 1], dtype=torch.long),
+        },
+        plan_dir / "test_links.pt",
+    )
+    cfg = _front3d_cfg()
+    cfg["dataset"]["split_plan_dir"] = str(plan_dir)
+
+    data = build_dataset([scene], cfg, require_all_anchors=False)
+
+    assert set(data["global_mobile_id"].astype(int).tolist()) == {0, 1, 2, 3}
+    assert 4 not in set(data["global_mobile_id"].astype(int).tolist())
+    assert 5 not in set(data["global_mobile_id"].astype(int).tolist())
+    assert set(data["source_link_ids"].reshape(-1).astype(int).tolist()) <= {-1, 0, 1, 2, 3, 4, 5, 6, 7}
+
+
 def test_converter_supports_deterministic_random_bs_selection() -> None:
     bs_ids = np.arange(10, dtype=np.int64)
     cfg = _front3d_cfg()
@@ -157,6 +197,29 @@ def test_converter_single_bs_random_selection_is_deterministic() -> None:
     assert selected.tolist() == selected_again.tolist()
     assert len(selected.tolist()) == 1
     assert selected.tolist()[0] in {1, 3, 5}
+
+
+def test_converter_uses_bs_selection_contract(tmp_path: Path) -> None:
+    contract = tmp_path / "bs_selection_contract.json"
+    contract.write_text(
+        """
+{
+  "schema_version": "baseline_bs_selection_contract_v1",
+  "contract_id": "bs_selection_v1",
+  "scenes": [
+    {"scene_id": "front3d_unit", "single_bs_ids": [3], "multi_bs_ids": [1, 4]}
+  ]
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    cfg = _front3d_cfg()
+    cfg["dataset"]["scene_id"] = "front3d_unit"
+    cfg["front3d"] = {"bs_count": 2, "bs_selection": "random", "bs_seed": 2026, "bs_contract": str(contract)}
+
+    selected = select_cfr_bs(np.arange(6, dtype=np.int64), cfg)
+
+    assert selected.tolist() == [1, 4]
 
 
 def test_deepmimo_converter_consumes_offline_cfr(tmp_path: Path) -> None:
