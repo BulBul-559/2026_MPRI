@@ -4,6 +4,7 @@ This project adapts the MPRI CFR-image localization baseline to the current base
 
 - Front3D CFR-only HDF5: `Front3d_2988_CFR_Only`
 - DeepMIMO offline CFR HDF5 produced by `../DeepMIMOFactory`
+- DICHASUS dcxx measured CFR through the locked VisionRadioLoc DXT manifests
 
 The active conversion path writes the MPRI input contract:
 
@@ -145,3 +146,5 @@ Unified evaluation metrics are `mean_error_m`, `mse_m2`, `median_error_m`, `rmse
 `predictions.csv` preserves per-sample results. Single-BS converted data is reported as `sample_kind=ue_bs_pair`; multi-BS converted data is reported as `sample_kind=ue_bs_set`. The table includes `bs_set_ids`, `valid_bs_ids`, `valid_bs_count`, and `source_link_ids`; missing selected BS slots are visible through `valid_bs_ids` and `source_link_ids`.
 
 Collection-level reporting uses the same two BaselineAnalysis aggregation routes: average scene-level `metrics.csv` rows for scene-mean metrics, and concatenate all scene `predictions.csv.error_m` rows to recompute pooled metrics/CDF. CDF curves are always pooled-sample CDFs over the full test scene pool.
+
+The formal DICHASUS entry point is `scripts/run_dichasus_formal.py`. It keeps MPRI's 193 uniformly sampled subcarriers, `50/20/10 dB` training augmentation, 60-epoch schedule, and dc41 validation-RMSE checkpoint selection while reading evaluation CFR in chunks. It consumes the exact nested dc40 BS0 support and dc41/dc30--dc34/dc42--dc44 BS0 query manifests used by VisionRadioLoc. Every final query is written to `predictions.csv` with run/measurement/BS/H5-row/link identity, prediction, GT, and radial error. `cost.json` records optimizer steps, augmented sample consumption, trainable parameters, wall-clock, and target-label count.
