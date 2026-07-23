@@ -251,3 +251,37 @@ The compact tracked result table is
 `paper_indoor_source_paper400_seed2026_metrics.csv`. Full predictions,
 checkpoints, logs, and converted data remain under ignored `runs/` and `data/`
 paths.
+
+## Image-Level Random-Split Hypothesis Test
+
+The paper states that the 14448 augmented CFR images are divided 80/20, but it
+does not explicitly state that all three SNR variants of one UE remain in the
+same split. A controlled A/B therefore keeps every setting above unchanged and
+changes only the split unit from UE group to individual augmented image.
+
+Config and runtime files:
+
+```text
+config/train/paper_indoor_source_image_random_paper400.yaml
+config/eval/paper_indoor_source_image_random_paper400.yaml
+queues/paper_indoor_source_image_random_paper400_seed2026.json
+jobs/paper_indoor_source_image_random_paper400_seed2026.json
+```
+
+The split fractions are written as `11559/14448` and `2889/14448` so that the
+task preserves the exact sample counts reported by the paper. With seed 2026,
+the declared split has the following properties:
+
+| Audit item | Value |
+|---|---:|
+| Train images | 11559 |
+| Test images | 2889 |
+| Unique train positions | 4777 |
+| Unique test positions | 2361 |
+| Positions represented in both splits | 2322 |
+| Test rows whose position also occurs in train | 2772 / 2889 (95.95%) |
+| Positions appearing only in test | 39 |
+
+This is intentionally a leakage diagnostic, not the baseline's recommended
+unseen-UE evaluation protocol. Its result must be reported beside, and never
+silently replace, the UE-grouped result. Final metrics are pending.

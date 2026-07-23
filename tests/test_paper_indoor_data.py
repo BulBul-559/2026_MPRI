@@ -88,6 +88,23 @@ def test_paper_indoor_converter_preserves_nchw_and_groups_snr_variants(tmp_path:
     assert len(splits["train"]) == 12
     assert len(splits["test"]) == 3
 
+    image_splits = split_indices_by_group(
+        dataset.group_ids("random"),
+        12 / 15,
+        0.0,
+        3 / 15,
+        seed=2026,
+    )
+    image_train_groups = set(
+        dataset.metadata_array("global_mobile_id")[image_splits["train"]].tolist()
+    )
+    image_test_groups = set(
+        dataset.metadata_array("global_mobile_id")[image_splits["test"]].tolist()
+    )
+    assert len(image_splits["train"]) == 12
+    assert len(image_splits["test"]) == 3
+    assert image_train_groups & image_test_groups
+
 
 def test_paper_indoor_converter_rejects_mismatched_labels(tmp_path: Path) -> None:
     labels = np.zeros((5, 3), dtype=np.float64)

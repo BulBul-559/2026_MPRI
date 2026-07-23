@@ -1,0 +1,43 @@
+experiment:
+  name: mpri_paper_indoor_source_image_random_paper400_seed2026
+  output_root: runs/paper_indoor_source_image_random/train
+
+data:
+  dataset: data/processed/paper_indoor_source/csi_snr50_20_10.h5
+  # Exact fractions reproduce the paper's reported 11559/2889 image counts.
+  train_split: 0.8000415282392026
+  val_split: 0.00
+  test_split: 0.19995847176079734
+  split_strategy: random
+  normalization: none
+
+model:
+  dropout: 0.3
+  output_dim: 3
+
+optimizer:
+  type: Adam
+  learning_rate: 0.001
+  weight_decay: 0.0
+
+scheduler:
+  type: StepLR
+  step_size: 50
+  gamma: 0.3
+
+loss:
+  type: rmse
+  eps: 1.0e-8
+
+training:
+  epochs: 400
+  batch_size: 32
+  seed: 2026
+  device: cuda:0
+  amp: false
+  max_norm: 5.0
+
+logging:
+  save_loss_figure: true
+  loss_figure_name: loss_curve.png
+  evaluate_test_each_epoch: true
