@@ -1,0 +1,112 @@
+{
+  "schema_version": "baseline_queue_v1",
+  "queue_name": "mpri_front3d_3308_one_room_multibs_raw768_paper400",
+  "continue_on_error": false,
+  "scheduler": {
+    "max_workers": 1,
+    "gpu": {
+      "enabled": true,
+      "allowed_indices": [0],
+      "min_free_memory_mb": 12000,
+      "max_utilization_pct": 20,
+      "scan_interval_s": 1.0,
+      "idle_required_s": 2.0,
+      "wait_timeout_s": null,
+      "max_tasks_per_gpu": 1,
+      "selection": "least_leased_then_most_free",
+      "set_cuda_visible_devices": true,
+      "device_env_var": "BASELINE_CUDA_DEVICE",
+      "device_env_value_when_visible": "cuda:0"
+    },
+    "monitor": {
+      "enabled": true,
+      "heartbeat_interval_s": 30.0,
+      "stalled_after_s": 1800.0,
+      "resource_sample_interval_s": 2.0,
+      "checkpoint_globs": [
+        "{task_root}/train/*/checkpoints/*.pt"
+      ]
+    }
+  },
+  "tasks": [
+    {
+      "task_id": "mpri_front3d_3308_one_room_multibs_raw768_paper400",
+      "project": "MPRI",
+      "task_root": "MPRI/runs/scheduler/front3d_3308_one_room_multibs_raw768_paper400",
+      "metadata": {
+        "model": "MPRI",
+        "dataset": "Front3d_2988_CFR_Only/noise_sub_test_set",
+        "scene_id": "front3d_3308",
+        "room_count": 1,
+        "room_area_m2": 33.4,
+        "bs_ids": [0, 1, 2, 3],
+        "subcarriers": 768,
+        "snr_db": [50, 20, 10],
+        "train_ues": 95,
+        "val_ues": 12,
+        "test_ues": 12,
+        "epochs": 400
+      },
+      "resources": {
+        "gpu_count": 1,
+        "gpu_memory_policy": "same_node",
+        "gpu_memory_budget_mb": 9000,
+        "gpu_min_free_memory_mb": 12000,
+        "gpu_max_utilization_pct": 20,
+        "gpu_idle_required_s": 2.0,
+        "gpu_exclusive": true,
+        "gpu_max_tasks_per_gpu": 1
+      },
+      "retry": {
+        "max_attempts": 2,
+        "backoff_s": 60,
+        "retry_on": ["cuda_oom", "io_transient", "completion_check"]
+      },
+      "partial_task_root_policy": "reuse",
+      "completion_check": {
+        "type": "file_json",
+        "path": "{task_root}/summary.json",
+        "required_keys": [
+          "train_run",
+          "checkpoint",
+          "eval_run",
+          "eval_metrics",
+          "predictions"
+        ]
+      },
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      },
+      "steps": [
+        {
+          "name": "train_paper400",
+          "argv": [
+            ".venv/bin/python",
+            "train_mpri.py",
+            "--config",
+            "config/train/front3d_3308_one_room_multibs_raw768_paper400.yaml",
+            "--output-root",
+            "{task_root}/train",
+            "--device",
+            "{env:BASELINE_CUDA_DEVICE}"
+          ]
+        },
+        {
+          "name": "evaluate_best",
+          "argv": [
+            ".venv/bin/python",
+            "scripts/evaluate_latest_train_run.py",
+            "--train-runs-root",
+            "{task_root}/train",
+            "--train-experiment-name",
+            "mpri_front3d_3308_one_room_multibs_raw768_paper400",
+            "--eval-config",
+            "config/eval/front3d_3308_one_room_multibs_raw768_paper400.yaml",
+            "--summary",
+            "{task_root}/summary.json"
+          ]
+        }
+      ]
+    }
+  ]
+}
