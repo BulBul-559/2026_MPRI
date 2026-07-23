@@ -8,11 +8,11 @@
       "enabled": true,
       "allowed_indices": [0, 5, 6, 7],
       "min_free_memory_mb": 12000,
-      "max_utilization_pct": 20,
+      "max_utilization_pct": 100,
       "scan_interval_s": 1.0,
       "idle_required_s": 2.0,
       "wait_timeout_s": null,
-      "max_tasks_per_gpu": 1,
+      "max_tasks_per_gpu": 3,
       "selection": "least_leased_then_most_free",
       "set_cuda_visible_devices": true,
       "device_env_var": "BASELINE_CUDA_DEVICE",
@@ -52,10 +52,10 @@
         "gpu_memory_policy": "same_node",
         "gpu_memory_budget_mb": 9000,
         "gpu_min_free_memory_mb": 12000,
-        "gpu_max_utilization_pct": 20,
+        "gpu_max_utilization_pct": 100,
         "gpu_idle_required_s": 2.0,
-        "gpu_exclusive": true,
-        "gpu_max_tasks_per_gpu": 1
+        "gpu_exclusive": false,
+        "gpu_max_tasks_per_gpu": 3
       },
       "retry": {
         "max_attempts": 2,

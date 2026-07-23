@@ -36,8 +36,9 @@ the four BS IDs from the central `bs_selection_v1` contract.
 - AMP: disabled
 - Checkpoint selection: validation RMSE
 - Test use: one independent evaluation of `best.pt` after training
-- Scheduler admission: one exclusive GPU selected from `[0, 5, 6, 7]`, with
-  at least 12 GB free memory and at most 20% utilization before launch
+- Scheduler admission: one GPU selected from `[0, 5, 6, 7]`, with at least
+  12 GB free memory and a 9 GB reservation. Shared admission is allowed only
+  when at most three tasks share the GPU and their declared reservations fit.
 
 The one-epoch CUDA smoke completed without OOM. It observed approximately
 7.7 GB peak GPU memory, took 14.0 seconds, and produced validation RMSE
