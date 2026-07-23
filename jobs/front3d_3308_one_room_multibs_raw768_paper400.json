@@ -1,5 +1,5 @@
 {
-  "job_id": "mpri_front3d_3308_one_room_multibs_raw768_paper400_seed2026_v1",
+  "job_id": "mpri_front3d_3308_one_room_multibs_raw768_paper400_seed2026_v2",
   "name": "MPRI front3d_3308 one-room 4BS raw768 paper400",
   "priority": 50,
   "manifest": "/data/sunmeiyuan/projects/BaselineAnalysis/MPRI/queues/front3d_3308_one_room_multibs_raw768_paper400.json",

@@ -6,7 +6,7 @@
     "max_workers": 1,
     "gpu": {
       "enabled": true,
-      "allowed_indices": [0],
+      "allowed_indices": [0, 5, 6, 7],
       "min_free_memory_mb": 12000,
       "max_utilization_pct": 20,
       "scan_interval_s": 1.0,
