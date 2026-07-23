@@ -158,5 +158,96 @@ runs/scheduler/paper_indoor_source_paper400_seed2026
 
 The task trains 400 epochs, restores `best.pt` for one standalone test pass,
 writes unified aggregate metrics, writes `metrics_by_snr.csv`, and retains all
-2889 prediction rows. Final timing and results will replace this pending note
-after the Scheduler task completes.
+2889 prediction rows.
+
+### Completion
+
+The Scheduler task completed on the first attempt with no monitor warnings:
+
+| Stage | Wall time |
+|---|---:|
+| 400-epoch train plus per-epoch test | 6051.03 s (1:40:51) |
+| Standalone best-checkpoint test | 12.21 s |
+| Complete Scheduler task | 6064.28 s (1:41:04) |
+
+Median epoch time was `15.00 s`; the sum of the 400 recorded epoch times was
+`6030.73 s`. Scheduler GPU telemetry is device-level and was contaminated by
+other processes sharing GPU 0, so its 11.6-GiB device peak is not an MPRI
+process-memory measurement. The observed MPRI process allocation during the run
+was approximately 1.7 GiB.
+
+The learning-rate trace was verified at every transition:
+
+```text
+epochs   1-50: 1.0000e-3
+epochs  51-100: 3.0000e-4
+epochs 101-150: 9.0000e-5
+epochs 151-200: 2.7000e-5
+epochs 201-250: 8.1000e-6
+epochs 251-300: 2.4300e-6
+epochs 301-350: 7.2900e-7
+epochs 351-400: 2.1870e-7
+```
+
+### Aggregate Test Result
+
+The standalone pass restored the test-RMSE-selected `best.pt`. It was selected
+at epoch 400, so `best.pt` and `last.pt` represent the same final model in this
+run.
+
+| Mean | MSE | Median | RMSE | CDF@1m | CDF@2m | P90 | P95 | P99 | Count |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2.1146 m | 7.2252 m² | 1.6768 m | 2.6880 m | 25.10% | 59.40% | 4.0502 m | 5.1443 m | 8.3124 m | 2889 |
+
+The lowest per-epoch test mean was `2.1072 m` at epoch 357, but the paper-style
+selection rule is RMSE, whose minimum was `2.6879 m` at epoch 400. The
+independent export differs only by normal floating-point/batch aggregation
+rounding.
+
+### Result By Released SNR Variant
+
+| SNR | Mean | Median | RMSE | CDF@1m | CDF@2m | P95 | Count |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 50 dB | 2.0778 m | 1.6691 m | 2.6314 m | 26.38% | 59.19% | 5.0719 m | 963 |
+| 20 dB | 2.0849 m | 1.6511 m | 2.6456 m | 25.23% | 60.02% | 5.0437 m | 963 |
+| 10 dB | 2.1811 m | 1.7026 m | 2.7842 m | 23.68% | 58.98% | 5.2874 m | 963 |
+
+All 963 held-out UE groups appear exactly once in every SNR variant. The modest
+degradation from 50 dB to 10 dB is directionally consistent with the intended
+augmentation, but the absolute localization accuracy is not close to the paper.
+
+### Paper Comparison
+
+| Metric | Paper Scenario 1 | This run |
+|---|---:|---:|
+| Mean error | 0.28 m | 2.1146 m |
+| Fraction at 0.28 m | 66% | 1.73% |
+| Fraction at 0.51 m | 90% | 7.06% |
+
+The full original-data chain is operational, but this run does **not**
+numerically reproduce the published indoor result. It is about 7.55 times worse
+in mean error. The released CFR values, axis conversion, grouped split counts,
+model input/output shape, epoch count, LR schedule, and metric export were all
+audited. Remaining plausible sources of the gap are details the paper does not
+fully specify or release: exact split membership/seed, optimizer and batch
+size, training loss, any additional normalization, and exact layer-level
+implementation details such as the output reduction. These are hypotheses, not
+established causes.
+
+### Artifact Audit
+
+- Training trajectory: 400 data rows, epochs 1 through 400.
+- Checkpoints: both record epoch 400, five input channels, 3D output, and
+  `normalization: none`.
+- Split: 11559 train images, zero validation images, 2889 test images, 4816
+  unique UE groups, and no train/test group overlap.
+- Predictions: 2889 finite rows and 2889 unique sample keys.
+- Test composition: 963 unique held-out positions and 963 rows at each of
+  50/20/10 dB.
+- Independent metric recomputation from `predictions.csv` matches the exported
+  aggregate and per-SNR CSV files.
+
+The compact tracked result table is
+`paper_indoor_source_paper400_seed2026_metrics.csv`. Full predictions,
+checkpoints, logs, and converted data remain under ignored `runs/` and `data/`
+paths.

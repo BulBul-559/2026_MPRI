@@ -88,6 +88,13 @@ repository fixes seed `2026`, Adam, batch size `32`, weight decay `0`, and
 dropout `0.3` as explicit implementation choices. The full audit and run record
 are in `docs/paper_indoor_source_reproduction_2026-07-23.md`.
 
+The completed paper400 run produced a test mean error of `2.1146 m`, median
+error of `1.6768 m`, and RMSE of `2.6880 m` over all `2889` test images. This
+validates the source-data training/evaluation chain, but it does not reproduce
+the paper's reported `0.28 m` indoor mean error. The result must therefore be
+described as a paper-aligned reimplementation result, not as a successful
+numerical reproduction of the paper.
+
 ## Front3D Noisy Workflow
 
 The paper uses SNR augmentation at `50/20/10 dB`. For Front3D, the current reproducible adaptation is an offline noisy dataset that expands each CFR link once per SNR level:
