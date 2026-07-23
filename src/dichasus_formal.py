@@ -56,8 +56,8 @@ def run_dichasus_formal(
     max_query_links: int | None = None,
 ) -> Path:
     """Train and evaluate MPRI on the locked formal DICHASUS BS0 protocol."""
-    if support_size not in {8, 32, 128, 512}:
-        raise ValueError("support_size must be one of 8, 32, 128, 512")
+    if support_size <= 0:
+        raise ValueError("support_size must be positive")
     if epochs <= 0 or batch_size <= 1 or eval_batch_size <= 0:
         raise ValueError("epochs/eval_batch_size must be positive and training batch_size must exceed one")
     if not 4 <= subcarrier_count <= 768:
@@ -92,7 +92,9 @@ def run_dichasus_formal(
     channel_std[channel_std < 1.0e-6] = 1.0
     train_features = (train_features - channel_mean) / channel_std
 
-    validation_name = protocol["stage2"]["single_bs_manifests"]["dc41"]
+    validation_name = protocol.get("stage1", {}).get("validation_manifest")
+    if validation_name is None:
+        validation_name = protocol["stage2"]["single_bs_manifests"]["dc41"]
     validation_manifest_path = manifest_root / f"{validation_name}.json"
     validation_manifest = _read_json(validation_manifest_path)
     _validate_manifest(validation_manifest)
@@ -248,7 +250,14 @@ def run_dichasus_formal(
     per_run_path = output / "per_run_metrics.csv"
     aggregate_path = output / "aggregate_metrics.csv"
     _write_csv(per_run_path, per_run_rows)
-    _write_csv(aggregate_path, _aggregate_rows(errors_by_run, support_size=support_size))
+    _write_csv(
+        aggregate_path,
+        _aggregate_rows(
+            errors_by_run,
+            support_size=support_size,
+            cohorts=_metric_cohorts(protocol),
+        ),
+    )
 
     contract = {
         "schema_version": "baseline_dichasus_mpri_formal_v1",
@@ -271,6 +280,7 @@ def run_dichasus_formal(
         "checkpoint_selection": "minimum dc41 validation RMSE",
         "selected_epoch": best_epoch,
         "selected_validation_rmse_m": best_val_rmse,
+        "condition_id": protocol.get("condition_id", "dxt_support_scaling"),
         "protocol_path": str(protocol_path),
         "protocol_sha256": _sha256(protocol_path),
         "support_manifest": str(support_manifest_path),
@@ -469,9 +479,24 @@ def _evaluation_manifests(
         yield ("validation" if run_id == 41 else "test"), run_id, manifest_root / f"{name}.json"
 
 
-def _aggregate_rows(errors_by_run: dict[int, np.ndarray], *, support_size: int) -> list[dict[str, Any]]:
+def _metric_cohorts(protocol: dict[str, Any]) -> dict[str, tuple[int, ...]]:
+    configured = protocol.get("baseline_native", {}).get("cohorts")
+    if configured is not None:
+        return {
+            str(name): tuple(int(run_id) for run_id in run_ids)
+            for name, run_ids in configured.items()
+        }
+    return {"validation": (41,), **TEST_COHORTS}
+
+
+def _aggregate_rows(
+    errors_by_run: dict[int, np.ndarray],
+    *,
+    support_size: int,
+    cohorts: dict[str, tuple[int, ...]] | None = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for cohort, run_ids in (("validation", (41,)), *TEST_COHORTS.items()):
+    for cohort, run_ids in (cohorts or {"validation": (41,), **TEST_COHORTS}).items():
         selected = [errors_by_run[run_id] for run_id in run_ids]
         run_metrics = [summarize_errors(values) for values in selected]
         macro = {

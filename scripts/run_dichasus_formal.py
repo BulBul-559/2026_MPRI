@@ -12,7 +12,7 @@ from src.dichasus_formal import run_dichasus_formal
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run MPRI on the locked formal DICHASUS protocol.")
     parser.add_argument("--protocol", required=True)
-    parser.add_argument("--support-size", required=True, type=int, choices=(8, 32, 128, 512))
+    parser.add_argument("--support-size", required=True, type=int)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--epochs", type=int, default=60)
