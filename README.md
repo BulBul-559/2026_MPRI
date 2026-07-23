@@ -95,6 +95,16 @@ the paper's reported `0.28 m` indoor mean error. The result must therefore be
 described as a paper-aligned reimplementation result, not as a successful
 numerical reproduction of the paper.
 
+A controlled 400-epoch diagnostic changed only the split unit from UE group to
+individual augmented image. Its mean error fell to `0.5140 m`, but `95.95%` of
+test images then had another SNR realization of the same UE position in the
+training set. Truly unseen positions still measured `1.5685 m`. This strongly
+supports image-level leakage as a major source of optimistic performance, but
+does not prove the paper used that split and still does not reproduce
+`0.28 m`. The UE-grouped split remains the formal baseline protocol. Full A/B,
+leakage, SNR, runtime, and artifact audits are recorded in
+`docs/paper_indoor_source_reproduction_2026-07-23.md`.
+
 ## Front3D Noisy Workflow
 
 The paper uses SNR augmentation at `50/20/10 dB`. For Front3D, the current reproducible adaptation is an offline noisy dataset that expands each CFR link once per SNR level:

@@ -284,4 +284,84 @@ the declared split has the following properties:
 
 This is intentionally a leakage diagnostic, not the baseline's recommended
 unseen-UE evaluation protocol. Its result must be reported beside, and never
-silently replace, the UE-grouped result. Final metrics are pending.
+silently replace, the UE-grouped result.
+
+### Completion
+
+The Scheduler task completed on the first attempt with no failures, retries, or
+monitor warnings:
+
+| Stage | Wall time |
+|---|---:|
+| 400-epoch train plus per-epoch test | 3395.97 s (56:36) |
+| Standalone best-checkpoint test | 15.32 s |
+| Complete Scheduler task | 3412.25 s (56:52) |
+
+The run used physical GPU 1 while it was otherwise empty. Scheduler telemetry
+recorded a device-level peak of `1727 MiB` and mean utilization of `57.53%`.
+The median epoch time was `8.63 s`, and the sum of the 400 recorded epoch times
+was `3373.06 s`.
+
+The test-RMSE-selected checkpoint is epoch 305. Its standalone evaluation
+contains 2889 finite prediction rows and reproduces the per-epoch metric within
+normal floating-point and batch-aggregation rounding.
+
+### Aggregate A/B Result
+
+| Split unit | Mean | MSE | Median | RMSE | CDF@1m | CDF@2m | P95 | Count |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| UE group (formal) | 2.1146 m | 7.2252 m² | 1.6768 m | 2.6880 m | 25.10% | 59.40% | 5.1443 m | 2889 |
+| Augmented image (diagnostic) | 0.5140 m | 0.4519 m² | 0.3926 m | 0.6723 m | 91.10% | 98.86% | 1.2453 m | 2889 |
+
+Changing only the split unit reduces mean error by `75.69%`. This strongly
+supports image-level split leakage as a major explanation for the numerical
+gap. It does not prove that the authors used this split, because the paper does
+not release the split membership, seed, or code.
+
+The image-level result still does not reproduce the reported `0.28 m` mean:
+it is `1.84x` larger. Its CDF is `28.38%` at `0.28 m` and `66.08%` at
+`0.51 m`, whereas the paper reports `66%` and `90%`, respectively.
+
+### Same-Position Leakage Audit
+
+Because each physical UE has three released SNR images, random image splitting
+usually leaves another SNR realization of a test position in the training set.
+The observed `95.95%` leakage rate agrees with the theoretical probability
+`1 - 0.2^2 = 96%`.
+
+| Same-position train evidence | Mean | MSE | Median | RMSE | CDF@1m | CDF@2m | P95 | Count |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| None: truly unseen UE | 1.5685 m | 3.5504 m² | 1.3476 m | 1.8842 m | 27.35% | 80.34% | 3.6757 m | 117 |
+| One other SNR image | 0.5560 m | 0.4475 m² | 0.4487 m | 0.6689 m | 89.67% | 99.44% | 1.2605 m | 900 |
+| Two other SNR images | 0.4280 m | 0.2604 m² | 0.3547 m | 0.5103 m | 95.78% | 99.73% | 0.9477 m | 1872 |
+| Any other SNR image | 0.4695 m | 0.3211 m² | 0.3811 m | 0.5667 m | 93.80% | 99.64% | 1.0874 m | 2772 |
+
+The monotonic improvement from no same-position image, to one, to two is direct
+evidence that the image-random aggregate is dominated by position leakage
+rather than generalization to unseen UEs.
+
+### Result By Released SNR Variant
+
+| SNR | Mean | Median | RMSE | CDF@1m | CDF@2m | P95 | Count |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 50 dB | 0.4522 m | 0.3614 m | 0.5948 m | 94.81% | 98.96% | 1.0032 m | 963 |
+| 20 dB | 0.4214 m | 0.3331 m | 0.5588 m | 96.09% | 99.16% | 0.8961 m | 947 |
+| 10 dB | 0.6644 m | 0.5291 m | 0.8268 m | 82.64% | 98.47% | 1.5400 m | 979 |
+
+Unlike the grouped split, random image splitting does not preserve equal SNR
+counts in the test set. The 10-dB variant remains materially harder.
+
+### Conclusion
+
+This controlled experiment confirms that split granularity can explain most,
+but not all, of the failed numerical reproduction. It narrows the likely
+remaining causes to the paper's unreleased split membership and implementation
+choices such as optimizer/batch size, loss definition, normalization, and exact
+pooling/output reduction. Those factors require separate one-variable
+ablations; they are not established causes here.
+
+The project therefore retains the UE-grouped result as its baseline-correct
+unseen-position evaluation. The image-random result is an explicit diagnostic
+only. Its compact tracked table is
+`paper_indoor_source_image_random_paper400_seed2026_metrics.csv`; full
+checkpoints, trajectories, and predictions remain under ignored `runs/`.
