@@ -87,6 +87,9 @@ def main() -> int:
         "predictions": str((eval_run / "predictions.csv").resolve()),
         "eval_config": str(args.eval_config.resolve()),
     }
+    metrics_by_snr = eval_run / "metrics_by_snr.csv"
+    if metrics_by_snr.is_file():
+        summary["metrics_by_snr"] = str(metrics_by_snr.resolve())
     args.summary.parent.mkdir(parents=True, exist_ok=True)
     args.summary.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(args.summary)

@@ -159,6 +159,26 @@ def write_metrics(path: Path, split: str, metrics: dict[str, Any]) -> None:
         writer.writerow(row)
 
 
+def write_metrics_by_snr(
+    path: Path,
+    snr_db: np.ndarray,
+    indices: list[int],
+    errors: np.ndarray,
+) -> None:
+    selected_snr = np.asarray(snr_db)[np.asarray(indices, dtype=np.int64)].astype(np.float64)
+    if selected_snr.shape[0] != errors.shape[0]:
+        raise ValueError(
+            f"SNR metadata length {selected_snr.shape[0]} does not match errors {errors.shape[0]}"
+        )
+    fieldnames = ["snr_db", *METRIC_COLUMNS]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for snr in sorted(np.unique(selected_snr).tolist(), reverse=True):
+            mask = np.isclose(selected_snr, snr)
+            writer.writerow({"snr_db": float(snr), **localization_metrics(errors[mask])})
+
+
 def write_predictions(path: Path, dataset: CFRDataset, indices: list[int], result: dict[str, Any]) -> None:
     gt = result["ground_truth"]
     pred = result["predictions"]
@@ -171,6 +191,9 @@ def write_predictions(path: Path, dataset: CFRDataset, indices: list[int], resul
         local_mobile = dataset.metadata_array("local_tx_id")
     shard = dataset.metadata_array("shard_index")
     source_file = dataset.metadata_array("source_file")
+    source_position_index = dataset.metadata_array("source_position_index")
+    source_variant_index = dataset.metadata_array("source_variant_index")
+    snr_db = dataset.metadata_array("snr_db")
     anchor_ids = dataset.metadata_array("global_anchor_ids")
     valid_anchor_mask = dataset.metadata_array("valid_anchor_mask")
     source_link_ids = dataset.metadata_array("source_link_ids")
@@ -191,6 +214,9 @@ def write_predictions(path: Path, dataset: CFRDataset, indices: list[int], resul
         "localized_side",
         "anchor_side",
         "source_file",
+        "source_position_index",
+        "source_variant_index",
+        "snr_db",
     ]
     dims = gt.shape[1]
     fieldnames.extend([f"true_{axis}" for axis in ["x_m", "y_m", "z_m"][:dims]])
@@ -206,7 +232,13 @@ def write_predictions(path: Path, dataset: CFRDataset, indices: list[int], resul
             source_ids = _source_link_ids(source_link_ids, sample_index)
             row = {
                 "sample_kind": sample_kind,
-                "sample_key": _sample_key(global_mobile, sample_index, bs_set_ids, valid_bs_ids),
+                "sample_key": _sample_key(
+                    global_mobile,
+                    sample_index,
+                    bs_set_ids,
+                    valid_bs_ids,
+                    snr_db=snr_db,
+                ),
                 "sample_index": sample_index,
                 "global_link_id": int(source_ids[0]) if source_ids else -1,
                 "source_link_ids": json.dumps(source_ids),
@@ -220,6 +252,17 @@ def write_predictions(path: Path, dataset: CFRDataset, indices: list[int], resul
                 "localized_side": str(attrs.get("localized_side", "")),
                 "anchor_side": str(attrs.get("anchor_side", "")),
                 "source_file": _decode(source_file[sample_index]) if source_file is not None else "",
+                "source_position_index": (
+                    int(source_position_index[sample_index])
+                    if source_position_index is not None
+                    else ""
+                ),
+                "source_variant_index": (
+                    int(source_variant_index[sample_index])
+                    if source_variant_index is not None
+                    else ""
+                ),
+                "snr_db": float(snr_db[sample_index]) if snr_db is not None else "",
                 "error_m": float(err[out_i]),
             }
             for dim, name in enumerate(["x_m", "y_m", "z_m"][:dims]):
@@ -251,12 +294,23 @@ def _source_link_ids(source_link_ids: np.ndarray | None, sample_index: int) -> l
     return [int(v) for v in values.tolist() if int(v) >= 0]
 
 
-def _sample_key(global_mobile: np.ndarray | None, sample_index: int, bs_set_ids: list[int], valid_bs_ids: list[int]) -> str:
+def _sample_key(
+    global_mobile: np.ndarray | None,
+    sample_index: int,
+    bs_set_ids: list[int],
+    valid_bs_ids: list[int],
+    *,
+    snr_db: np.ndarray | None = None,
+) -> str:
     ue_id = int(global_mobile[sample_index]) if global_mobile is not None else int(sample_index)
     if len(bs_set_ids) == 1:
         bs = valid_bs_ids[0] if valid_bs_ids else bs_set_ids[0]
-        return f"ue={ue_id}:bs={bs}"
-    return f"ue={ue_id}:bs_set={','.join(str(v) for v in bs_set_ids)}"
+        key = f"ue={ue_id}:bs={bs}"
+    else:
+        key = f"ue={ue_id}:bs_set={','.join(str(v) for v in bs_set_ids)}"
+    if snr_db is not None:
+        key += f":snr_db={float(snr_db[sample_index]):g}"
+    return key
 
 
 def _decode(value: Any) -> str:
@@ -283,13 +337,30 @@ def main() -> None:
     model, checkpoint = load_model(args.checkpoint, device)
     stats = checkpoint["statistics"]
     dataset = CFRDataset(cfg["data"]["dataset"], preload=True)
-    dataset.transform = NormalizeTransform(torch.as_tensor(stats["mean"]), torch.as_tensor(stats["std"]))
+    normalization = str(stats.get("normalization", "channel_standardize")).lower()
+    if normalization == "channel_standardize":
+        dataset.transform = NormalizeTransform(
+            torch.as_tensor(stats["mean"]),
+            torch.as_tensor(stats["std"]),
+        )
+    elif normalization == "none":
+        dataset.transform = None
+    else:
+        raise ValueError(f"Unsupported checkpoint normalization: {normalization}")
     indices = split_indices(checkpoint, cfg["data"]["split"], len(dataset))
     loader = DataLoader(Subset(dataset, indices), batch_size=cfg["eval"]["batch_size"], shuffle=False)
     result = evaluate_model(model, loader, device)
     metrics = result["metrics"]
     metrics["axis_mae_json"] = json.dumps(metrics.pop("axis_mae"))
     write_metrics(run_dir / "metrics.csv", cfg["data"]["split"], metrics)
+    snr_db = dataset.metadata_array("snr_db")
+    if snr_db is not None:
+        write_metrics_by_snr(
+            run_dir / "metrics_by_snr.csv",
+            snr_db,
+            indices,
+            result["errors"],
+        )
     if cfg["eval"]["save_predictions"]:
         write_predictions(run_dir / "predictions.csv", dataset, indices, result)
     print(json.dumps({"split": cfg["data"]["split"], **metrics}, ensure_ascii=False, indent=2))

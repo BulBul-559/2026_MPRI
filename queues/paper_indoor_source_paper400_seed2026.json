@@ -1,0 +1,118 @@
+{
+  "schema_version": "baseline_queue_v1",
+  "queue_name": "mpri_paper_indoor_source_paper400_seed2026",
+  "continue_on_error": false,
+  "scheduler": {
+    "max_workers": 1,
+    "gpu": {
+      "enabled": true,
+      "allowed_indices": [0, 5, 6, 7],
+      "min_free_memory_mb": 5000,
+      "max_utilization_pct": 100,
+      "scan_interval_s": 1,
+      "idle_required_s": 2,
+      "wait_timeout_s": null,
+      "max_tasks_per_gpu": 3,
+      "selection": "least_leased_then_most_free",
+      "set_cuda_visible_devices": true,
+      "device_env_var": "BASELINE_CUDA_DEVICE",
+      "device_env_value_when_visible": "cuda:0"
+    },
+    "monitor": {
+      "enabled": true,
+      "heartbeat_interval_s": 30,
+      "stalled_after_s": 1800,
+      "resource_sample_interval_s": 2,
+      "checkpoint_globs": [
+        "{task_root}/train/*/checkpoints/*.pt"
+      ]
+    }
+  },
+  "tasks": [
+    {
+      "task_id": "mpri_paper_indoor_source_paper400_seed2026",
+      "project": "MPRI",
+      "task_root": "MPRI/runs/scheduler/paper_indoor_source_paper400_seed2026",
+      "metadata": {
+        "model": "MPRI",
+        "dataset": "original MPRI Scenario 1 indoor",
+        "positions": 4816,
+        "samples": 14448,
+        "train_samples": 11559,
+        "test_samples": 2889,
+        "gNBs": 5,
+        "mimo_channels": 16,
+        "subcarriers": 193,
+        "snr_db": [50, 20, 10],
+        "output_dim": 3,
+        "epochs": 400,
+        "seed": 2026
+      },
+      "resources": {
+        "gpu_count": 1,
+        "gpu_memory_policy": "same_node",
+        "gpu_memory_budget_mb": 3000,
+        "gpu_min_free_memory_mb": 5000,
+        "gpu_max_utilization_pct": 100,
+        "gpu_idle_required_s": 2,
+        "gpu_exclusive": false,
+        "gpu_max_tasks_per_gpu": 3
+      },
+      "retry": {
+        "max_attempts": 2,
+        "backoff_s": 60,
+        "retry_on": [
+          "cuda_oom",
+          "io_transient",
+          "completion_check"
+        ]
+      },
+      "partial_task_root_policy": "reuse",
+      "completion_check": {
+        "type": "file_json",
+        "path": "{task_root}/summary.json",
+        "required_keys": [
+          "train_run",
+          "checkpoint",
+          "eval_run",
+          "eval_metrics",
+          "metrics_by_snr",
+          "predictions"
+        ]
+      },
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      },
+      "steps": [
+        {
+          "name": "train_paper400",
+          "argv": [
+            ".venv/bin/python",
+            "train_mpri.py",
+            "--config",
+            "config/train/paper_indoor_source_paper400.yaml",
+            "--output-root",
+            "{task_root}/train",
+            "--device",
+            "{env:BASELINE_CUDA_DEVICE}"
+          ]
+        },
+        {
+          "name": "evaluate_best",
+          "argv": [
+            ".venv/bin/python",
+            "scripts/evaluate_latest_train_run.py",
+            "--train-runs-root",
+            "{task_root}/train",
+            "--train-experiment-name",
+            "mpri_paper_indoor_source_paper400_seed2026",
+            "--eval-config",
+            "config/eval/paper_indoor_source_paper400.yaml",
+            "--summary",
+            "{task_root}/summary.json"
+          ]
+        }
+      ]
+    }
+  ]
+}

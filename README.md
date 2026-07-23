@@ -10,10 +10,13 @@ The active conversion path writes the MPRI input contract:
 
 ```text
 features: (W, H, C, N)
-labels/position: (N, 2)
+labels/position: (N, D)
 ```
 
 `W` is the flattened CFR/image feature width, `H` is selected subcarriers, `C` is the BS/anchor depth, and `N` is samples. Configs must declare `dataset.format: front3d` or `dataset.format: deepmimo`. Data roots can be overridden with `BASELINE_FRONT3D_ROOT`, `BASELINE_FRONT3D_NOISE_ROOT`, and `BASELINE_DEEPMIMO_CFR_ROOT`.
+
+`D=2` for the current Front3D/DeepMIMO adaptations. The original paper indoor
+dataset uses `D=3`.
 
 DeepMIMO production is intentionally outside this repository. MPRI consumes `deepmimo_cfr_v1` HDF5 scenes with `cfr` axes `[link, rx_ant, tx_ant, subcarrier]` and then performs its own MPRI conversion plus optional SNR augmentation. It does not read DeepMIMO raw `.mat` files or synthesize CFR from path parameters.
 
@@ -49,6 +52,41 @@ Confirmed from the paper:
 - The paper reports a `0.8` train/test split.
 
 Not fully specified in the paper and still tracked for review: optimizer details and batch size.
+
+## Original Paper Indoor Dataset
+
+The original Scenario 1 MATLAB v7.3 files are supported through a dedicated
+adapter rather than the Front3D/DeepMIMO CFR converter:
+
+```bash
+MPRI_PAPER_INDOOR_ROOT=/path/to/mpri_raw \
+.venv/bin/python scripts/convert_paper_indoor_data.py \
+  --config config/data/paper_indoor_source.yaml
+```
+
+The adapter requires the author-provided `50/20/10 dB` files to contain
+identical `4816 x 3` position labels and CFR images with h5py axes
+`(sample, gNB, MIMO channel, subcarrier)` and shape `(4816, 5, 16, 193)`. It writes
+`data/processed/paper_indoor_source/csi_snr50_20_10.h5` with project storage
+shape `(16, 193, 5, 14448)`, which the loader exposes as
+`(14448, 5, 193, 16)`. No second AWGN pass is applied: these files already
+contain the paper's PHY-stage noise variants.
+
+The formal source-data run uses `config/train/paper_indoor_source_paper400.yaml`:
+
+- UE-grouped `80/0/20` split, yielding the paper counts `11559/0/2889`
+- all three SNR variants of a UE remain in one split
+- 3D position head and five-gNB input
+- no additional input standardization, because the released CFR images are
+  already processed and the paper does not state a second standardization step
+- 400 epochs, `1e-3` initial learning rate, and `StepLR(50, 0.3)`
+- test evaluation every epoch and test-RMSE best-checkpoint selection, matching
+  the paper's stated experimental protocol
+
+The paper does not publish its split seed, optimizer, or batch size. This
+repository fixes seed `2026`, Adam, batch size `32`, weight decay `0`, and
+dropout `0.3` as explicit implementation choices. The full audit and run record
+are in `docs/paper_indoor_source_reproduction_2026-07-23.md`.
 
 ## Front3D Noisy Workflow
 
@@ -143,7 +181,7 @@ Each conversion run writes under `data/processed/`; each training run writes `co
 
 Unified evaluation metrics are `mean_error_m`, `mse_m2`, `median_error_m`, `rmse_m`, `cdf_1m`, `cdf_2m`, `p90_error_m`, `p95_error_m`, `p99_error_m`, and `valid_sample_count`. `evaluate_mpri.py` writes this schema to `metrics.csv`; `train_mpri.py` keeps the old epoch columns such as `train_rmse` and `train_mean_err` and also adds the prefixed unified columns for train/val/test.
 
-`predictions.csv` preserves per-sample results. Single-BS converted data is reported as `sample_kind=ue_bs_pair`; multi-BS converted data is reported as `sample_kind=ue_bs_set`. The table includes `bs_set_ids`, `valid_bs_ids`, `valid_bs_count`, and `source_link_ids`; missing selected BS slots are visible through `valid_bs_ids` and `source_link_ids`.
+`predictions.csv` preserves per-sample results. Single-BS converted data is reported as `sample_kind=ue_bs_pair`; multi-BS converted data is reported as `sample_kind=ue_bs_set`. The table includes `bs_set_ids`, `valid_bs_ids`, `valid_bs_count`, and `source_link_ids`; missing selected BS slots are visible through `valid_bs_ids` and `source_link_ids`. Datasets with SNR variants also export `snr_db`, `source_position_index`, and `source_variant_index`; their evaluation run includes `metrics_by_snr.csv`.
 
 Collection-level reporting uses the same two BaselineAnalysis aggregation routes: average scene-level `metrics.csv` rows for scene-mean metrics, and concatenate all scene `predictions.csv.error_m` rows to recompute pooled metrics/CDF. CDF curves are always pooled-sample CDFs over the full test scene pool.
 

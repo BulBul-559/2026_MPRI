@@ -36,6 +36,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "val_split": 0.2,
         "test_split": 0.1,
         "split_strategy": "position_level",
+        "normalization": "channel_standardize",
     },
     "model": {
         "dropout": 0.3,
@@ -257,6 +258,7 @@ def build_dataloaders(
     test_split: float,
     split_strategy: str,
     seed: int,
+    normalization: str = "channel_standardize",
     overfit_n: int | None = None,
     split_plan_dir: str | Path | None = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, Any], Dict[str, Any]]:
@@ -301,12 +303,21 @@ def build_dataloaders(
         test_indices_tensor = train_indices_tensor.clone()
         print(f"[调试模式] 使用 {overfit_n} 个样本", flush=True)
 
-    # 在训练集上计算归一化统计量
+    normalization = normalization.lower()
+    if normalization not in {"channel_standardize", "none"}:
+        raise ValueError(f"不支持的 normalization: {normalization}")
+
+    # 论文源数据已经是作者发布的 CFR image；是否再标准化必须由配置显式决定。
     features = base_dataset.features_tensor()[train_indices_tensor]
-    mean = features.mean(dim=(0, 2, 3))
-    std = features.std(dim=(0, 2, 3))
-    norm = NormalizeTransform(mean, std)
-    base_dataset.transform = norm
+    if normalization == "channel_standardize":
+        mean = features.mean(dim=(0, 2, 3))
+        std = features.std(dim=(0, 2, 3))
+        base_dataset.transform = NormalizeTransform(mean, std)
+    else:
+        mean = torch.zeros(features.shape[1], dtype=features.dtype)
+        std = torch.ones(features.shape[1], dtype=features.dtype)
+        base_dataset.transform = None
+    print(f"输入归一化: {normalization}", flush=True)
 
     # 打印输入 shape 信息（论文版要求）
     sample_shape = features[0].shape
@@ -340,7 +351,12 @@ def build_dataloaders(
         num_workers=0,
     )
 
-    stats = {"mean": mean.cpu(), "std": std.cpu(), "label_dim": int(base_dataset.labels_tensor().shape[1])}
+    stats = {
+        "mean": mean.cpu(),
+        "std": std.cpu(),
+        "normalization": normalization,
+        "label_dim": int(base_dataset.labels_tensor().shape[1]),
+    }
     split_info = {
         "train_indices": train_indices_tensor.tolist(),
         "val_indices": val_indices_tensor.tolist(),
@@ -354,6 +370,7 @@ def build_dataloaders(
         "test_split": test_split,
         "split_source": split_source,
         "split_plan_dir": str(split_plan_dir) if split_plan_dir is not None else "",
+        "normalization": normalization,
     }
     return train_loader, val_loader, test_loader, stats, split_info
 
@@ -562,6 +579,9 @@ def validate_and_normalize_config(config: Dict[str, Any]) -> None:
     config["experiment"]["output_root"] = str(config["experiment"].get("output_root", "runs"))
     config["data"]["dataset"] = str(config["data"].get("dataset", "data/csi/csi_strict.h5"))
     config["data"]["split_strategy"] = str(config["data"].get("split_strategy", "position_level"))
+    config["data"]["normalization"] = str(
+        config["data"].get("normalization", "channel_standardize")
+    ).lower()
     if config["data"].get("split_plan_dir") is not None:
         config["data"]["split_plan_dir"] = str(config["data"]["split_plan_dir"])
     config["data"]["train_split"] = float(config["data"].get("train_split", 1.0 - float(config["data"].get("val_split", 0.2)) - float(config["data"].get("test_split", 0.0))))
@@ -619,6 +639,8 @@ def validate_and_normalize_config(config: Dict[str, Any]) -> None:
         raise ValueError("data.train_split + data.val_split + data.test_split 必须等于 1")
     if config["model"]["output_dim"] <= 0:
         raise ValueError("model.output_dim 必须大于 0")
+    if config["data"]["normalization"] not in {"channel_standardize", "none"}:
+        raise ValueError("data.normalization 必须是 channel_standardize 或 none")
 
     optimizer_type = config["optimizer"]["type"].lower()
     if optimizer_type not in {"adam", "adamw"}:
@@ -707,6 +729,7 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
     val_split = float(config["data"]["val_split"])
     test_split = float(config["data"]["test_split"])
     split_strategy = str(config["data"]["split_strategy"])
+    normalization = str(config["data"]["normalization"])
     split_plan_dir = config["data"].get("split_plan_dir")
     dropout = float(config["model"]["dropout"])
     output_dim = int(config["model"]["output_dim"])
@@ -755,6 +778,7 @@ def run_training(config: Dict[str, Any], config_source: Path, run_dir: Path) -> 
         test_split,
         split_strategy,
         seed,
+        normalization=normalization,
         split_plan_dir=split_plan_dir,
     )
 

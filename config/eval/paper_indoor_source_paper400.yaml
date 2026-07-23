@@ -1,0 +1,12 @@
+experiment:
+  name: mpri_paper_indoor_source_paper400_test_seed2026
+  output_root: runs/paper_indoor_source/eval
+
+data:
+  dataset: data/processed/paper_indoor_source/csi_snr50_20_10.h5
+  split: test
+
+eval:
+  batch_size: 64
+  device: cuda:0
+  save_predictions: true

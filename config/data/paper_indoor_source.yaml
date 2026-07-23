@@ -1,0 +1,23 @@
+dataset:
+  root_env: MPRI_PAPER_INDOOR_ROOT
+  root: ../data/mpri_raw
+  sources:
+    - file: dataset_SNR50_indoor_21-11-16_23-11.mat
+      snr_db: 50
+    - file: dataset_SNR20_indoor_21-11-17_01-50.mat
+      snr_db: 20
+    - file: dataset_SNR10_indoor_21-11-17_03-07.mat
+      snr_db: 10
+
+expected:
+  positions: 4816
+  gNBs: 5
+  mimo_channels: 16
+  subcarriers: 193
+  label_dims: 3
+
+output:
+  path: data/processed/paper_indoor_source/csi_snr50_20_10.h5
+  compression: gzip
+  compression_level: 4
+  chunk_samples: 16
