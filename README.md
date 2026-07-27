@@ -187,9 +187,16 @@ For formal Front3D M117 conversion, the converter must receive
 `dataset.split_plan_dir` or `front3d.split_plan_dir`. It filters source HDF5
 rows by the union of `train_links.pt`, `val_links.pt`, and `test_links.pt`.
 For the noisy Front3D dataset this filter is applied through
-`noise/source_local_link_index`, so expanded SNR rows still inherit the clean
-m117 link eligibility. A converted HDF5 containing a UE or source link outside
-the split plan is invalid and must be regenerated.
+`noise/source_local_link_index` and the split plan's matching
+`source_local_link_index` field, so expanded SNR row indices are never compared
+with clean-source row indices. Expanded SNR rows still inherit the clean m117
+link eligibility. A converted HDF5 containing a UE or source link outside the
+split plan is invalid and must be regenerated.
+
+Scheduler-managed conversions should pass `--report-out <task_root>/conversion_report.json`
+and use that task-local JSON as the completion check. The processed HDF5 path
+is shared across reruns, so its existence alone does not prove that the current
+conversion code executed.
 
 For formal multi-BS baseline runs, use the padded output. Padded samples keep
 the fixed per-scene `bs_set_ids`, fill missing selected-BS feature slots with

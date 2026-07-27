@@ -8,7 +8,13 @@ import pytest
 import torch
 import yaml
 
-from scripts.convert_cfr_to_csi import build_dataset, input_files, load_config, select_cfr_bs
+from scripts.convert_cfr_to_csi import (
+    apply_front3d_m117_link_plan_filter,
+    build_dataset,
+    input_files,
+    load_config,
+    select_cfr_bs,
+)
 from src.data import CFRDataset, split_indices_by_group
 from src.model import MPRINet, count_parameters
 from train_mpri import split_indices_from_plan
@@ -194,6 +200,49 @@ def test_front3d_converter_filters_to_m117_link_plan(tmp_path: Path) -> None:
     assert 4 not in set(data["global_mobile_id"].astype(int).tolist())
     assert 5 not in set(data["global_mobile_id"].astype(int).tolist())
     assert set(data["source_link_ids"].reshape(-1).astype(int).tolist()) <= {-1, 0, 1, 2, 3, 4, 5, 6, 7}
+
+
+def test_noise_filter_matches_source_local_link_index_domain(tmp_path: Path) -> None:
+    scene = tmp_path / "front3d_noise_unit.h5"
+    source_indices = np.repeat(np.arange(4, dtype=np.int64), 3)
+    with h5py.File(scene, "w") as handle:
+        noise = handle.create_group("noise")
+        noise.create_dataset("source_local_link_index", data=source_indices)
+
+    plan_dir = tmp_path / "front3d_noise_unit_seed2026_ue_level"
+    plan_dir.mkdir()
+    torch.save(
+        {
+            "local_link_index": torch.tensor([0, 1, 2], dtype=torch.long),
+            "source_local_link_index": torch.tensor([0, 0, 0], dtype=torch.long),
+        },
+        plan_dir / "train_links.pt",
+    )
+    torch.save(
+        {
+            "local_link_index": torch.tensor([6, 7, 8], dtype=torch.long),
+            "source_local_link_index": torch.tensor([2, 2, 2], dtype=torch.long),
+        },
+        plan_dir / "val_links.pt",
+    )
+    torch.save(
+        {
+            "local_link_index": torch.tensor([], dtype=torch.long),
+            "source_local_link_index": torch.tensor([], dtype=torch.long),
+        },
+        plan_dir / "test_links.pt",
+    )
+    cfg = _front3d_cfg()
+    cfg["dataset"]["split_plan_dir"] = str(plan_dir)
+
+    with h5py.File(scene, "r") as handle:
+        filtered = apply_front3d_m117_link_plan_filter(
+            handle,
+            cfg,
+            np.ones(source_indices.size, dtype=bool),
+        )
+
+    assert np.flatnonzero(filtered).tolist() == [0, 1, 2, 6, 7, 8]
 
 
 def test_converter_supports_deterministic_random_bs_selection() -> None:

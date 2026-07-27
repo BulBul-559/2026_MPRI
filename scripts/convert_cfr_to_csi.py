@@ -53,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert offline CFR HDF5 data for MPRI.")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing processed files.")
+    parser.add_argument(
+        "--report-out",
+        type=Path,
+        help="Also write the completed conversion report to this stable path.",
+    )
     return parser.parse_args()
 
 
@@ -564,15 +569,18 @@ def apply_front3d_m117_link_plan_filter(f: h5py.File, cfg: dict[str, Any], valid
     plan_dir = resolve_m117_split_plan_dir(cfg)
     if plan_dir is None:
         return valid
-    allowed = load_m117_source_link_indices(plan_dir)
-    if allowed.size == 0:
-        raise ValueError(f"M117 split plan has no links: {plan_dir}")
     if "noise/source_local_link_index" in f:
         source_idx = np.asarray(f["noise/source_local_link_index"], dtype=np.int64)
+        plan_index_key = "source_local_link_index"
     elif "source_local_link_index" in f:
         source_idx = np.asarray(f["source_local_link_index"], dtype=np.int64)
+        plan_index_key = "source_local_link_index"
     else:
         source_idx = np.arange(valid.shape[0], dtype=np.int64)
+        plan_index_key = "local_link_index"
+    allowed = load_m117_source_link_indices(plan_dir, index_key=plan_index_key)
+    if allowed.size == 0:
+        raise ValueError(f"M117 split plan has no links for {plan_index_key}: {plan_dir}")
     if source_idx.shape[0] != valid.shape[0]:
         raise ValueError(
             "M117 source index length mismatch: "
@@ -596,7 +604,7 @@ def resolve_m117_split_plan_dir(cfg: dict[str, Any]) -> Path | None:
     return path.resolve()
 
 
-def load_m117_source_link_indices(plan_dir: Path) -> np.ndarray:
+def load_m117_source_link_indices(plan_dir: Path, *, index_key: str = "local_link_index") -> np.ndarray:
     try:
         import torch
     except ModuleNotFoundError as exc:
@@ -607,9 +615,9 @@ def load_m117_source_link_indices(plan_dir: Path) -> np.ndarray:
         if not path.exists():
             raise FileNotFoundError(f"M117 split file not found: {path}")
         plan = torch.load(path, map_location="cpu", weights_only=False)
-        if not isinstance(plan, dict) or "local_link_index" not in plan:
-            raise ValueError(f"{path} must contain local_link_index")
-        values = plan["local_link_index"]
+        if not isinstance(plan, dict) or index_key not in plan:
+            raise ValueError(f"{path} must contain {index_key}")
+        values = plan[index_key]
         values = values.detach().cpu().numpy() if hasattr(values, "detach") else np.asarray(values)
         parts.append(np.asarray(values, dtype=np.int64).reshape(-1))
     return np.unique(np.concatenate(parts, axis=0)).astype(np.int64)
@@ -903,7 +911,17 @@ def main() -> None:
     args = parse_args()
     try:
         cfg = load_config(args.config)
-        convert(cfg, overwrite=args.overwrite)
+        run_dir = convert(cfg, overwrite=args.overwrite)
+        if args.report_out is not None:
+            report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+            report["conversion_run"] = str(run_dir.resolve())
+            report["completed_at"] = datetime.now().isoformat(timespec="seconds")
+            report_out = args.report_out.resolve()
+            report_out.parent.mkdir(parents=True, exist_ok=True)
+            report_out.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise
