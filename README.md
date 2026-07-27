@@ -34,6 +34,15 @@ not from the legacy paper-style example configs. The current reporting standard 
 - Training: 60 epochs on `cuda:0`
 - Selection/eval: `best.pt` selected by validation RMSE, then `evaluate_mpri.py` on the scene `test` split
 
+The isolated `front3d_6477` MultiBS geometry-fix patch is a separate paper-style
+400-epoch run. It consumes the existing offline `50/20/10 dB` noisy scene,
+raw 768 subcarriers, and
+`bs_selection_v2_front3d_6477_geometry_fix`, which changes only that scene's
+MultiBS group from `[3,5,7,11]` to `[0,2,3,5]`. Its conversion, training, and
+evaluation configs are named
+`front3d_6477_multibs_geometry_fix_v2_raw768_paper400.yaml`. The patch creates
+new artifacts and never overwrites v1 collection results.
+
 Generate and run the formal 339-scene queue from `D:\SunMeiyuan\baseline`:
 
 ```powershell

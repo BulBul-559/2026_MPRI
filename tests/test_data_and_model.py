@@ -6,6 +6,7 @@ import h5py
 import numpy as np
 import pytest
 import torch
+import yaml
 
 from scripts.convert_cfr_to_csi import build_dataset, input_files, load_config, select_cfr_bs
 from src.data import CFRDataset, split_indices_by_group
@@ -60,6 +61,25 @@ def _write_noise_status(root: Path, rows: list[tuple[str, str, int]]) -> None:
         h5_path = root / "scenes" / f"{scene_id}.h5"
         lines.append(f"{order},{scene_id},{status},{h5_path.as_posix()},,1,1,3,{snr_count},")
     (root / "build_status.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_front3d_6477_geometry_fix_config_is_paper400_multibs() -> None:
+    data_cfg = load_config(
+        Path("config/data/front3d_6477_multibs_geometry_fix_v2_raw768_paper400.yaml")
+    )
+    train_cfg = yaml.safe_load(
+        Path(
+            "config/train/front3d_6477_multibs_geometry_fix_v2_raw768_paper400.yaml"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert data_cfg["dataset"]["scene_id"] == "front3d_6477"
+    assert data_cfg["front3d"]["bs_count"] == 4
+    assert data_cfg["front3d"]["bs_contract_key"] == "multi_bs_ids"
+    assert "bs_selection_v2_front3d_6477_geometry_fix" in data_cfg["front3d"]["bs_contract"]
+    assert data_cfg["subcarriers"] == {"policy": "first", "count": 768}
+    assert data_cfg["augmentation"]["enabled"] is False
+    assert train_cfg["training"]["epochs"] == 400
 
 
 def test_noise_scene_file_uses_dedicated_root_env_and_current_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
